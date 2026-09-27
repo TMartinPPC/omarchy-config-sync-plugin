@@ -269,8 +269,15 @@ function appendShortcuts(out, list, summaryField, both, hiddenMap) {
   for (var i = 0; i < rows.length; i++) {
     var s = rows[i]
     if (isItemHidden("s", s.keys, hiddenMap, s)) continue
-    var sum = summaryField === "detail" ? (s.detail || s.label || "") : (s.label || "")
-    out.push(reviewItem("s", s.keys, s.keys, sum, s.status, "Shortcut", both || s.status === "both", 0, false))
+    var sum = (summaryField === "detail" || s.portable === false)
+      ? (s.detail || s.skip_reason || s.label || "")
+      : (s.label || "")
+    var row = reviewItem("s", s.keys, s.keys, sum, s.status, "Shortcut", both || s.status === "both", 0, false)
+    // Non-portable binds depend on surrounding Lua declarations and cannot be
+    // cherry-picked safely. Keep them visible as an explanation without
+    // presenting an Include control that the backend would silently ignore.
+    row.pickable = s.portable !== false
+    out.push(row)
   }
 }
 

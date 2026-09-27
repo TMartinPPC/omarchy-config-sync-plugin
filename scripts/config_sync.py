@@ -83,7 +83,7 @@ SKIP_DIR_NAMES = {".git", "__pycache__", ".mypy_cache", ".pytest_cache", "node_m
 SKIP_FILE_NAMES = {".DS_Store"}
 SKIP_NAME_RE = re.compile(r"\.bak(\.|$)")
 PROTECTED_PLUGINS = {PLUGIN_ID}  # this plugin is excluded from sync so it does not self-report or overwrite itself
-PLUGIN_VERSION = "1.4.0"
+PLUGIN_VERSION = "1.4.1"
 
 FILE_SUMMARIES = {
     "hypr/autostart.lua": "Autostart programs",
@@ -2608,19 +2608,34 @@ def bind_command_text(line: str) -> str:
 
 def bind_portability(
     command: str, portable_locals: dict[str, str], local_names: set[str]
-) -> tuple[bool, str, str]:
+) -> tuple[bool, str, str, list[str], list[str]]:
     rewritten = _replace_lua_idents(command, portable_locals)
-    leftover = [
+    leftover = {
         chain.split(".", 1)[0]
         for chain in _lua_ident_chains(rewritten)
         if chain.split(".", 1)[0] not in SAFE_LUA_ROOTS
-    ]
+    }
     if not leftover:
-        return True, rewritten, ""
-    used_local = next((name for name in leftover if name in local_names), None)
-    if used_local:
-        return False, command, "references a local defined elsewhere in the file"
-    return False, command, "command is not self-contained"
+        return True, rewritten, "", [], []
+    local_dependencies = sorted(leftover & local_names)
+    undefined_dependencies = sorted(leftover - local_names)
+    if undefined_dependencies:
+        return False, command, "command is not self-contained", local_dependencies, undefined_dependencies
+    return False, command, "references a local defined elsewhere in the file", local_dependencies, []
+
+
+def shortcut_entry_portable_to(entry: dict[str, Any], destination_local_names: set[str]) -> bool:
+    """Whether a bind can load after being cherry-picked into a destination.
+
+    A command that calls a file-local helper is not standalone, but it is safe
+    to copy when the destination already declares every helper it references.
+    """
+    if entry.get("portable", True):
+        return True
+    if entry.get("undefined_dependencies"):
+        return False
+    dependencies = set(entry.get("local_dependencies") or [])
+    return bool(dependencies) and dependencies <= destination_local_names
 
 
 def parse_shortcuts(text: str) -> list[dict[str, str]]:
@@ -2663,9 +2678,17 @@ def extract_bind_statements(text: str) -> list[dict[str, Any]]:
             span = bind_command_span(line, bind)
             if span:
                 command, start, end = span
-                portable, rewritten, skip_reason = bind_portability(command, portable_locals, local_names)
+                portable, rewritten, skip_reason, local_dependencies, undefined_dependencies = bind_portability(
+                    command, portable_locals, local_names
+                )
                 if portable and rewritten != command:
                     sync_raw = (line[:start] + rewritten + line[end:]).rstrip("\n")
+            else:
+                local_dependencies = []
+                undefined_dependencies = []
+        else:
+            local_dependencies = []
+            undefined_dependencies = []
         if keys not in by_key:
             order.append(keys)
         by_key[keys] = {
@@ -2677,6 +2700,8 @@ def extract_bind_statements(text: str) -> list[dict[str, Any]]:
             "sync_raw": sync_raw,
             "portable": portable,
             "skip_reason": skip_reason,
+            "local_dependencies": local_dependencies,
+            "undefined_dependencies": undefined_dependencies,
         }
     return [by_key[key] for key in order]
 
@@ -2692,6 +2717,8 @@ def shortcut_diff(
     repo_text = read_text(repo_path, within=repo_within) if repo_path.is_file() else ""
     local_map = {e["keys"]: e for e in extract_bind_statements(local_text)}
     repo_map = {e["keys"]: e for e in extract_bind_statements(repo_text)}
+    _, local_names = extract_portable_locals(local_text)
+    _, repo_names = extract_portable_locals(repo_text)
     local_file_hash = file_hash(local_path, "hypr/bindings.lua", within=local_within) if local_path.is_file() else None
     repo_file_hash = file_hash(repo_path, "hypr/bindings.lua", within=repo_within) if repo_path.is_file() else None
     local_at_baseline = bool(stored_hash) and local_file_hash == stored_hash
@@ -2728,8 +2755,8 @@ def shortcut_diff(
             change = "changed"
         local_label = (local_e or {}).get("label") or ""
         repo_label = (repo_e or {}).get("label") or ""
-        local_portable = bool((local_e or {}).get("portable", True)) if local_e else True
-        repo_portable = bool((repo_e or {}).get("portable", True)) if repo_e else True
+        local_portable = shortcut_entry_portable_to(local_e, repo_names) if local_e else True
+        repo_portable = shortcut_entry_portable_to(repo_e, local_names) if repo_e else True
         skip_reason = ""
         if status in {"added-repo", "repo"}:
             label = repo_label or local_label or keys
@@ -2779,12 +2806,13 @@ def shortcut_diff(
 
 def upsert_shortcut_lines(dest_text: str, source_entries: dict[str, dict[str, Any]], selected_keys: list[str]) -> str:
     dest_entries = {e["keys"]: e for e in extract_bind_statements(dest_text)}
+    _, dest_local_names = extract_portable_locals(dest_text)
     lines = dest_text.splitlines(keepends=True)
     replacements: dict[int, str] = {}
     append: list[str] = []
     for key in selected_keys:
         src = source_entries.get(key)
-        if not src or not src.get("portable", True):
+        if not src or not shortcut_entry_portable_to(src, dest_local_names):
             continue
         raw = str(src.get("sync_raw") or src["raw"]).rstrip("\n") + "\n"
         dest = dest_entries.get(key)
@@ -2828,13 +2856,16 @@ def merge_shortcuts_file(
     return True
 
 
-def filter_portable_shortcuts(source_text: str, keys: list[str]) -> tuple[list[str], list[dict[str, str]]]:
+def filter_portable_shortcuts(
+    source_text: str, keys: list[str], destination_text: str = ""
+) -> tuple[list[str], list[dict[str, str]]]:
     entries = {e["keys"]: e for e in extract_bind_statements(source_text)}
+    _, destination_local_names = extract_portable_locals(destination_text)
     kept: list[str] = []
     skipped: list[dict[str, str]] = []
     for key in keys:
         entry = entries.get(key)
-        if entry and entry.get("portable", True):
+        if entry and shortcut_entry_portable_to(entry, destination_local_names):
             kept.append(key)
         else:
             skipped.append(
@@ -2855,12 +2886,21 @@ def skipped_shortcut_note(skipped: list[dict[str, str]]) -> str:
 
 
 def portable_shortcut_selection(
-    source: Path, keys: list[str], source_within: Path | None = None
+    source: Path,
+    keys: list[str],
+    source_within: Path | None = None,
+    destination: Path | None = None,
+    destination_within: Path | None = None,
 ) -> tuple[list[str], list[dict[str, str]]]:
     if not keys:
         return [], []
     text = read_text(source, within=source_within) if source.is_file() else ""
-    return filter_portable_shortcuts(text, keys)
+    destination_text = (
+        read_text(destination, within=destination_within)
+        if destination is not None and destination.is_file()
+        else ""
+    )
+    return filter_portable_shortcuts(text, keys, destination_text)
 
 
 def unloadable_bind_entries(text: str) -> list[dict[str, Any]]:
@@ -4114,7 +4154,11 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     skipped_shortcuts: list[dict[str, str]] = []
     if shortcut_keys:
         shortcut_keys, skipped_shortcuts = portable_shortcut_selection(
-            repo / "hypr" / "bindings.lua", shortcut_keys, source_within=repo
+            repo / "hypr" / "bindings.lua",
+            shortcut_keys,
+            source_within=repo,
+            destination=ctx.config_hypr / "bindings.lua",
+            destination_within=ctx.home,
         )
     if requested_shortcuts and wanted is not None:
         wanted.discard("hypr/bindings.lua")
@@ -4330,7 +4374,11 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     skipped_shortcuts: list[dict[str, str]] = []
     if shortcut_keys:
         shortcut_keys, skipped_shortcuts = portable_shortcut_selection(
-            ctx.config_hypr / "bindings.lua", shortcut_keys, source_within=ctx.home
+            ctx.config_hypr / "bindings.lua",
+            shortcut_keys,
+            source_within=ctx.home,
+            destination=repo / "hypr" / "bindings.lua",
+            destination_within=repo,
         )
     if requested_shortcuts and wanted is not None:
         wanted.discard("hypr/bindings.lua")

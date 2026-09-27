@@ -462,6 +462,35 @@ class ShortcutTests(unittest.TestCase):
         self.assertFalse(rows[0]["portable"])
         self.assertIn("local", rows[0]["skip_reason"])
 
+    def test_apply_function_bind_when_destination_has_the_helper(self) -> None:
+        with TempHome() as env:
+            repo = make_config_repo(env.home / "cfg")
+            helper = (
+                "local function send_shortcut_once(mods, key)\n"
+                "  return function() end\n"
+                "end\n"
+            )
+            write(
+                repo / "hypr" / "bindings.lua",
+                helper + 'o.bind("SUPER + Cyrillic_ES", "Universal copy", send_shortcut_once("CTRL", "C"))\n',
+            )
+            write(env.ctx.config_hypr / "bindings.lua", helper)
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+
+            snap = cs.cmd_snapshot(env.ctx, argparse_ns())
+            row = next(r for r in snap["diff"]["shortcuts"] if r["keys"] == "SUPER + Cyrillic_ES")
+            self.assertTrue(row["repo_portable"])
+            self.assertTrue(row["default_apply"])
+
+            applied = cs.cmd_apply(
+                env.ctx,
+                argparse_ns(explicit=True, files="", shortcut=["SUPER + Cyrillic_ES"]),
+            )
+            self.assertTrue(applied["ok"], applied)
+            self.assertFalse(applied.get("skipped_shortcuts"), applied)
+            text = (env.ctx.config_hypr / "bindings.lua").read_text(encoding="utf-8")
+            self.assertIn('o.bind("SUPER + Cyrillic_ES"', text)
+
     def test_poisoned_repo_bind_is_not_applied(self) -> None:
         with TempHome() as env:
             repo = make_config_repo(env.home / "cfg")
@@ -1219,6 +1248,36 @@ class SecurityTests(unittest.TestCase):
 
 
 class ModelJsTests(unittest.TestCase):
+    def test_unavailable_helper_dependent_shortcut_is_not_pickable(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node not available")
+
+        model_path = ROOT / "Model.js"
+        script = f"""
+const fs = require('fs');
+const vm = require('vm');
+const code = fs.readFileSync({json.dumps(str(model_path))}, 'utf8').replace(/^\\.pragma\\s+library\\s*/m, '');
+const ctx = {{}};
+vm.createContext(ctx);
+vm.runInContext(code, ctx);
+
+const dependent = {{
+  keys: 'SUPER + Cyrillic_ES', label: 'Universal copy',
+  detail: 'skipped — references a local defined elsewhere in the file',
+  status: 'added-repo', portable: false
+}};
+const rows = ctx.buildIncomingItems([], [dependent], [], [], [], [], {{}});
+console.log(JSON.stringify({{
+  row: rows[0]
+}}));
+"""
+        proc = subprocess.run([node, "-e", script], capture_output=True, text=True, check=True)
+        data = json.loads(proc.stdout.strip())
+
+        self.assertFalse(data["row"]["pickable"])
+        self.assertIn("references a local", data["row"]["summary"])
+
     def test_incoming_and_outgoing_plugin_isolation(self) -> None:
         node = shutil.which("node")
         if not node:

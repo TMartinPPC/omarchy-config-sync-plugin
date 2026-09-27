@@ -2711,7 +2711,7 @@ Panel {
               }
 
               Row {
-                visible: catRowBox.rowBoth
+                visible: catRowBox.rowBoth && catRowBox.pickable
                 spacing: Style.space(4)
                 anchors.verticalCenter: parent.verticalCenter
                 Button {
@@ -3091,7 +3091,7 @@ Panel {
           }
 
           Row {
-            visible: rowBox.rowBoth
+            visible: rowBox.rowBoth && rowBox.pickable
             spacing: Style.space(4)
             anchors.verticalCenter: parent.verticalCenter
             Button {

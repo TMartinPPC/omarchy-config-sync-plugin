@@ -115,6 +115,20 @@ function isBundledPath(path) {
     || p.indexOf("bin/") === 0
 }
 
+// One-line description of a file's per-device rule, e.g. "only desktop, htpc"
+// or "never laptop · blocked here". Empty when the file has no rule.
+function targetHint(targets, deviceState) {
+  var t = targets || null
+  if (!t) return ""
+  var bits = []
+  if (t.only && t.only.length) bits.push("only " + t.only.join(", "))
+  if (t.exclude && t.exclude.length) bits.push("never " + t.exclude.join(", "))
+  if (!bits.length) return ""
+  var label = bits.join(" · ")
+  if (String(deviceState || "") === "blocked") return label + " · blocked here"
+  return label
+}
+
 function reviewItem(kind, id, label, summary, status, typeLabel, both, changedCount, hidden, changes) {
   return {
     kind: kind,
@@ -324,6 +338,8 @@ function appendLooseFiles(out, files, both, hiddenMap) {
     var sum = f.semantic_summary || f.summary || ""
     var fileRow = reviewItem("f", p, p, sum, f.status, "File", both || f.status === "both", 0, false, f.changes || [])
     fileRow.removal = !!f.removal
+    fileRow.targets = f.targets || null
+    fileRow.deviceState = String(f.device_state || "default")
     out.push(fileRow)
   }
 }

@@ -600,6 +600,116 @@ def validate_safe_rel_path(rel: str) -> bool:
     return not any(":" in p or "\0" in p or "\n" in p for p in parts)
 
 
+# Per-device sync rules live in the repo marker so a rule set once applies on
+# every linked machine. Each rule names a tracked repo path and the devices it
+# may sync to: {"only": [..]} allowlists, {"exclude": [..]} blocks, both
+# together require allowlist membership without a blocklist hit.
+SYNC_TARGETS_KEY = "sync_targets"
+MAX_TARGET_PATHS = 512
+MAX_TARGET_DEVICES = 64
+DEVICE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$")
+
+
+def normalize_device_name(name: Any) -> str | None:
+    text = str(name or "").strip()
+    if not text or "\n" in text or "\0" in text:
+        return None
+    if not DEVICE_NAME_RE.fullmatch(text):
+        return None
+    return text.lower()
+
+
+def parse_device_list(raw: Any) -> list[str]:
+    """Normalize a CSV device list from CLI or marker into a lowercase,
+    de-duplicated list, dropping invalid names. Split on commas only so
+    multi-word names like "my desk top" survive; marker values are lists."""
+    if isinstance(raw, str):
+        items = raw.split(",")
+    elif isinstance(raw, list):
+        items = [str(item) for item in raw]
+    else:
+        return []
+    out: list[str] = []
+    for item in items:
+        name = normalize_device_name(item)
+        if name and name not in out and len(out) < MAX_TARGET_DEVICES:
+            out.append(name)
+    return out
+
+
+def device_names(ctx: Context) -> set[str]:
+    """Every name this machine answers to: its hostname and an optional
+    friendly device_name saved in state."""
+    names: set[str] = set()
+    host = normalize_device_name(socket.gethostname())
+    if host:
+        names.add(host)
+    extra = normalize_device_name(load_state(ctx).get("device_name"))
+    if extra:
+        names.add(extra)
+    return names
+
+
+def device_targets(repo: Path | None) -> dict[str, dict[str, list[str]]]:
+    """Read the marker's sync_targets map, dropping anything malformed.
+
+    The marker arrives through git, so treat it as input: unknown shapes,
+    unsafe paths, and oversized maps are ignored rather than trusted.
+    """
+    if repo is None:
+        return {}
+    marker = load_json(repo / MARKER_NAME, default={}, within=repo)
+    raw = marker.get(SYNC_TARGETS_KEY) if isinstance(marker, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+    targets: dict[str, dict[str, list[str]]] = {}
+    for rel, rule in list(raw.items())[:MAX_TARGET_PATHS]:
+        if not isinstance(rel, str) or not validate_safe_rel_path(rel) or not isinstance(rule, dict):
+            continue
+        only = parse_device_list(rule.get("only"))
+        exclude = parse_device_list(rule.get("exclude"))
+        if not only and not exclude:
+            continue
+        entry: dict[str, list[str]] = {}
+        if only:
+            entry["only"] = only
+        if exclude:
+            entry["exclude"] = exclude
+        targets[rel] = entry
+    return targets
+
+
+def device_target_state(rel: str, targets: dict[str, dict[str, list[str]]], names: set[str]) -> str:
+    """How a per-device rule treats this machine for one path.
+
+    - "blocked": the rule keeps the file away from this device.
+    - "included": the rule targets this device, opting even machine-local
+      files (monitors.lua) into sync here.
+    - "default": no rule for the path; existing machine-local rules apply.
+    """
+    rule = targets.get(rel) if targets else None
+    if not rule:
+        return "default"
+    # Rule entries are normalized on read, but match case-insensitively anyway
+    # so a hand-edited marker cannot silently stop matching.
+    only = {str(n).lower() for n in (rule.get("only") or [])}
+    exclude = {str(n).lower() for n in (rule.get("exclude") or [])}
+    if only and not names.intersection(only):
+        return "blocked"
+    if exclude and names.intersection(exclude):
+        return "blocked"
+    return "included"
+
+
+def write_device_targets(repo: Path, targets: dict[str, dict[str, list[str]]]) -> None:
+    write_marker(repo)
+    marker_path = repo / MARKER_NAME
+    data = load_json(marker_path, default={}, within=repo)
+    data = data if isinstance(data, dict) else {}
+    data[SYNC_TARGETS_KEY] = targets
+    write_json(marker_path, data, within=repo)
+
+
 def read_source_argument(args: argparse.Namespace) -> str:
     """Collect the repo URL/path for connect and set-url.
 
@@ -1835,6 +1945,8 @@ def collect_inventory(ctx: Context, repo: Path) -> list[dict[str, Any]]:
     repo_resolved = repo.resolve()
     home_resolved = ctx.home.resolve()
     local_paths = machine_local_paths(repo)
+    targets = device_targets(repo)
+    names = device_names(ctx)
 
     def add(rel: str, local: Path, repo_file: Path, group: str, extra: dict[str, Any] | None = None) -> None:
         if not validate_safe_rel_path(rel):
@@ -1870,6 +1982,8 @@ def collect_inventory(ctx: Context, repo: Path) -> list[dict[str, Any]]:
             "group": group,
             "summary": summary_for(rel),
             "portable": not is_machine_local(rel, local_paths),
+            "device_state": device_target_state(rel, targets, names),
+            "targets": targets.get(rel),
             "local_path": str(local),
             "repo_path": str(repo_file),
             "local_exists": local_regular,
@@ -1994,7 +2108,12 @@ def classify_file(item: dict[str, Any], stored_hash: str | None) -> str:
     repo_exists = bool(item.get("repo_exists"))
     if local_exists and repo_exists and local_hash == repo_hash:
         return "identical"
-    if not item.get("portable", True):
+    # A per-device rule overrides machine-local for this device: a rule that
+    # names this device opts even monitors.lua into sync; a rule that blocks
+    # this device makes the file look machine-local so it never shows as drift.
+    if item.get("device_state") == "blocked":
+        return "machine"
+    if not item.get("portable", True) and item.get("device_state") != "included":
         return "machine"
     if stored_hash:
         local_changed = local_exists and local_hash != stored_hash
@@ -3409,7 +3528,7 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
         plugin_id = plugin_id_from_path(item["path"])
         item["default_apply"] = (
             default_apply_status(status)
-            and item["portable"]
+            and (item["portable"] or item.get("device_state") == "included")
             and item["repo_exists"]
             and not item.get("git_managed")
             and not item["hidden"]
@@ -3641,6 +3760,7 @@ def build_snapshot(ctx: Context, fetch: bool = False) -> dict[str, Any]:
         "last_publish_at": state.get("last_publish_at"),
         "last_applied_commit": (state.get("last_applied_commit") or "")[:7],
         "hostname": socket.gethostname(),
+        "device_name": str(state.get("device_name") or ""),
         **git_fields,
         "valid": validation["valid"],
         "reasons": validation["reasons"],
@@ -3758,6 +3878,7 @@ def finish_connect(ctx: Context, repo: Path, repo_url: str, using_existing: bool
             "has hypr/ configs plus shell.json, plugins/, or apply.sh.",
             extra={"validation": validation},
         )
+    previous = load_state(ctx)
     state = {
         "repo_url": repo_url,
         "clone_path": str(repo),
@@ -3765,6 +3886,7 @@ def finish_connect(ctx: Context, repo: Path, repo_url: str, using_existing: bool
         "connected_at": now_iso(),
         "file_hashes": {},
         "hostname": socket.gethostname(),
+        "device_name": str(previous.get("device_name") or ""),
         "empty_seed": empty,
     }
     save_state(ctx, state)
@@ -4032,6 +4154,10 @@ def selected_items(diff_files: list[dict[str, Any]], wanted: set[str] | None, in
     chosen = []
     for item in diff_files:
         rel = item["path"]
+        # A device rule wins over include_machine: a file blocked on this
+        # device never syncs here, even when named explicitly.
+        if item.get("device_state") == "blocked":
+            continue
         if wanted is not None:
             if rel not in wanted:
                 continue
@@ -4042,7 +4168,9 @@ def selected_items(diff_files: list[dict[str, Any]], wanted: set[str] | None, in
                 continue
             if direction == "publish" and not item.get("default_publish"):
                 continue
-        if not include_machine and not item["portable"]:
+        # A rule targeting this device opts even machine-local files in without
+        # the global include toggle.
+        if not include_machine and not (item["portable"] or item.get("device_state") == "included"):
             continue
         if direction == "apply" and not item["repo_exists"] and wanted is None:
             continue
@@ -4165,7 +4293,7 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     unresolved_both = [
         i
         for i in diff["files"]
-        if not i.get("hidden") and i["status"] == "both" and (i["portable"] or args.include_machine) and (wanted is None or i["path"] in wanted)
+        if not i.get("hidden") and i["status"] == "both" and (i["portable"] or args.include_machine or i.get("device_state") == "included") and (wanted is None or i["path"] in wanted)
     ]
     if unresolved_both and wanted is None:
         raise SyncError(
@@ -4385,7 +4513,7 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     unresolved_both = [
         i
         for i in diff["files"]
-        if not i.get("hidden") and i["status"] == "both" and (i["portable"] or args.include_machine) and (wanted is None or i["path"] in wanted)
+        if not i.get("hidden") and i["status"] == "both" and (i["portable"] or args.include_machine or i.get("device_state") == "included") and (wanted is None or i["path"] in wanted)
     ]
     if unresolved_both and wanted is None:
         raise SyncError(
@@ -4592,7 +4720,8 @@ def cmd_resync(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         for item in diff["files"]
         if not item.get("hidden")
         and item.get("status") in wanted_status
-        and (item.get("portable") or args.include_machine)
+        and item.get("device_state") != "blocked"
+        and (item.get("portable") or args.include_machine or item.get("device_state") == "included")
         and (item.get("repo_exists") if side == "repo" else item.get("local_exists"))
     ]
     shortcuts = [
@@ -4975,6 +5104,95 @@ def cmd_unhide(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     return snap
 
 
+def cmd_targets(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
+    """Manage per-device sync rules and this device's friendly name.
+
+    targets              — list rules and this device's identity
+    targets set <path> [--only a,b] [--exclude c,d]   — upsert; empty lists clear a side
+    targets clear <path> — drop the rule
+    targets rename <name> — save a friendly device_name in this machine's state
+    """
+    state = load_state(ctx)
+    repo = configured_repo(ctx, state)
+    sub = str((args.args[0] if args.args else "list")).strip().lower()
+    rest = args.args[1:]
+
+    if sub == "rename":
+        raw = " ".join(rest).strip() or str(getattr(args, "name", "") or "").strip()
+        name = normalize_device_name(raw)
+        if not name:
+            raise SyncError("Use letters, digits, spaces, dots, dashes, or underscores (max 64 chars) for the device name.")
+        state["device_name"] = name
+        save_state(ctx, state)
+        snap = build_snapshot(ctx, fetch=False)
+        snap["message"] = f"This device is now '{name}'."
+        return snap
+
+    targets = device_targets(repo)
+
+    if sub == "list":
+        return ok(
+            {
+                "targets": targets,
+                "device": {"hostname": socket.gethostname(), "name": str(state.get("device_name") or "")},
+                "marker": str(repo / MARKER_NAME),
+            }
+        )
+
+    if sub not in {"set", "clear"}:
+        raise SyncError("Unknown targets action. Use list, set, clear, or rename.")
+
+    rel = str(rest[0] if rest else getattr(args, "files", "") or "").strip()
+    if not validate_safe_rel_path(rel):
+        raise SyncError("Pass the repo-relative path the rule is about, for example hypr/monitors.lua.")
+
+    if sub == "set":
+        only = parse_device_list(getattr(args, "only", None))
+        exclude = parse_device_list(getattr(args, "exclude", None))
+        if not only and not exclude:
+            targets.pop(rel, None)
+        else:
+            rule: dict[str, list[str]] = {}
+            if only:
+                rule["only"] = only
+            if exclude:
+                rule["exclude"] = exclude
+            targets[rel] = rule
+    else:
+        targets.pop(rel, None)
+
+    write_device_targets(repo, targets)
+
+    # Rules only matter once other machines can read them: commit the marker
+    # and push so the next Apply on another device honors the change. A failed
+    # push is not fatal — the rule rides along with the next Publish.
+    committed = False
+    pushed = False
+    push_error = None
+    dirty = git_out(repo, "status", "--porcelain", "--", MARKER_NAME)
+    if dirty:
+        ensure_git_identity(repo)
+        run_git(repo, ["add", MARKER_NAME], check=True)
+        result = run_git(repo, ["commit", "-m", f"Update sync targets for {rel}"], timeout=30)
+        if result.returncode == 0:
+            committed = True
+    result = run_git(repo, ["push", "-u", "origin", "HEAD"], timeout=PUSH_TIMEOUT)
+    if result.returncode == 0:
+        pushed = True
+    else:
+        push_error = git_error_message(["push"], result)
+
+    payload = {
+        "targets": targets,
+        "device": {"hostname": socket.gethostname(), "name": str(state.get("device_name") or "")},
+        "committed": committed,
+        "pushed": pushed,
+    }
+    if push_error:
+        payload["push_error"] = push_error
+    return ok(payload)
+
+
 def listed_plugin_arg(args: argparse.Namespace) -> str:
     pid = args.args[0] if args.args else ""
     if not valid_plugin_id(pid):
@@ -5077,6 +5295,7 @@ def build_parser() -> argparse.ArgumentParser:
             "resync",
             "hide",
             "unhide",
+            "targets",
             "open",
             "terminal",
             "install-plugin",
@@ -5100,6 +5319,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--url", default=None)
     parser.add_argument("--stdin", action="store_true", help="Read input URL from stdin")
     parser.add_argument("--all", action="store_true")
+    parser.add_argument("--only", default=None, help="Comma-separated devices a file syncs to")
+    parser.add_argument("--exclude", default=None, help="Comma-separated devices a file never syncs to")
+    parser.add_argument("--name", default=None, help="Friendly name for this device")
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -5128,6 +5350,8 @@ def dispatch(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         return cmd_hide(ctx, args)
     if command == "unhide":
         return cmd_unhide(ctx, args)
+    if command == "targets":
+        return cmd_targets(ctx, args)
     if command == "open":
         return cmd_open(ctx, args)
     if command == "terminal":

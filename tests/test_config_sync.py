@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -3149,6 +3150,243 @@ console.log(JSON.stringify({{
         self.assertEqual(out["picked"], 1)
         self.assertEqual(out["category"], "plugins")
 
+    def test_loose_files_carry_targets_and_hint_renders(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node not available")
+        script = f"""
+const fs = require('fs');
+const vm = require('vm');
+const code = fs.readFileSync({json.dumps(str(ROOT / "Model.js"))}, 'utf8').replace(/^\\.pragma\\s+library\\s*/m, '');
+const ctx = {{}};
+vm.createContext(ctx);
+vm.runInContext(code, ctx);
+const files = [
+  {{ path: 'hypr/monitors.lua', status: 'repo', targets: {{ only: ['desktop'] }}, device_state: 'blocked' }},
+  {{ path: 'omarchy/shell.json', status: 'local', targets: {{ exclude: ['laptop'] }}, device_state: 'included' }},
+  {{ path: 'hypr/input.lua', status: 'both' }}
+];
+const rows = [];
+ctx.appendLooseFiles(rows, files, false, {{}});
+console.log(JSON.stringify({{
+  rows, hintBlocked: ctx.targetHint(files[0].targets, 'blocked'), hintInclude: ctx.targetHint(files[1].targets, 'included'), hintNone: ctx.targetHint(null, 'default')
+}}));
+"""
+        out = json.loads(subprocess.run([node, "-e", script], capture_output=True, text=True, check=True).stdout)
+        by_path = {r["itemId"]: r for r in out["rows"]}
+        self.assertEqual(by_path["hypr/monitors.lua"]["targets"], {"only": ["desktop"]})
+        self.assertEqual(by_path["hypr/monitors.lua"]["deviceState"], "blocked")
+        self.assertEqual(by_path["omarchy/shell.json"]["deviceState"], "included")
+        self.assertIsNone(by_path["hypr/input.lua"]["targets"])
+        self.assertEqual(out["hintBlocked"], "only desktop · blocked here")
+        self.assertEqual(out["hintInclude"], "never laptop")
+        self.assertEqual(out["hintNone"], "")
 
-if __name__ == "__main__":
-    unittest.main()
+
+class DeviceNameTests(unittest.TestCase):
+    def test_normalize_device_name(self) -> None:
+        self.assertEqual(cs.normalize_device_name("Laptop"), "laptop")
+        self.assertEqual(cs.normalize_device_name("  Desk-Top_1 "), "desk-top_1")
+        self.assertIsNone(cs.normalize_device_name(""))
+        self.assertIsNone(cs.normalize_device_name(None))
+        self.assertIsNone(cs.normalize_device_name("-leading"))
+        self.assertIsNone(cs.normalize_device_name("has\nnewline"))
+        self.assertIsNone(cs.normalize_device_name("x" * 65))
+
+    def test_parse_device_list_csv_and_invalid(self) -> None:
+        self.assertEqual(cs.parse_device_list("Desktop, laptop ,DESKTOP,,-bad"), ["desktop", "laptop"])
+        self.assertEqual(cs.parse_device_list(["A", "b", "a"]), ["a", "b"])
+        self.assertEqual(cs.parse_device_list(None), [])
+        self.assertEqual(cs.parse_device_list(42), [])
+
+    def test_parse_device_list_caps_size(self) -> None:
+        raw = ",".join(f"dev{i}" for i in range(cs.MAX_TARGET_DEVICES + 10))
+        out = cs.parse_device_list(raw)
+        self.assertEqual(len(out), cs.MAX_TARGET_DEVICES)
+
+
+class DeviceTargetStateTests(unittest.TestCase):
+    NAMES = {"desktop", "laptop"}
+
+    def test_no_rule_is_default(self) -> None:
+        self.assertEqual(cs.device_target_state("hypr/shell.json", {}, self.NAMES), "default")
+        self.assertEqual(cs.device_target_state("hypr/shell.json", None, self.NAMES), "default")
+
+    def test_only_allowlists(self) -> None:
+        targets = {"hypr/monitors.lua": {"only": ["desktop"]}}
+        self.assertEqual(cs.device_target_state("hypr/monitors.lua", targets, {"desktop"}), "included")
+        self.assertEqual(cs.device_target_state("hypr/monitors.lua", targets, {"laptop"}), "blocked")
+        # A device with no known name (rule targets someone else) is blocked.
+        self.assertEqual(cs.device_target_state("hypr/monitors.lua", targets, set()), "blocked")
+
+    def test_exclude_blocks(self) -> None:
+        targets = {"omarchy/shell.json": {"exclude": ["laptop"]}}
+        self.assertEqual(cs.device_target_state("omarchy/shell.json", targets, {"laptop"}), "blocked")
+        self.assertEqual(cs.device_target_state("omarchy/shell.json", targets, {"desktop"}), "included")
+
+    def test_exclude_wins_over_only(self) -> None:
+        targets = {"omarchy/shell.json": {"only": ["desktop", "laptop"], "exclude": ["laptop"]}}
+        self.assertEqual(cs.device_target_state("omarchy/shell.json", targets, {"laptop"}), "blocked")
+        self.assertEqual(cs.device_target_state("omarchy/shell.json", targets, {"desktop"}), "included")
+
+    def test_match_is_case_insensitive(self) -> None:
+        targets = {"hypr/monitors.lua": {"only": ["DeskTop"]}}
+        self.assertEqual(cs.device_target_state("hypr/monitors.lua", targets, {"desktop"}), "included")
+
+
+class DeviceTargetsMarkerTests(unittest.TestCase):
+    def test_reads_valid_rules_and_drops_malformed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            write(
+                repo / cs.MARKER_NAME,
+                json.dumps(
+                    {
+                        "format": "omarchy-config",
+                        "sync_targets": {
+                            "hypr/monitors.lua": {"only": ["Desktop", "desktop", "htpc"]},
+                            "../etc/passwd": {"only": ["evil"]},
+                            "not/a dict": "nope",
+                            "hypr/input.lua": {"only": [], "exclude": "laptop, workstation"},
+                            "hypr/bad.lua": {"only": "x" * 100},
+                        },
+                    }
+                )
+                + "\n",
+            )
+            targets = cs.device_targets(repo)
+            self.assertEqual(targets["hypr/monitors.lua"], {"only": ["desktop", "htpc"]})
+            self.assertEqual(targets["hypr/input.lua"], {"exclude": ["laptop", "workstation"]})
+            self.assertNotIn("../etc/passwd", targets)
+            self.assertNotIn("not/a dict", targets)
+            self.assertNotIn("hypr/bad.lua", targets)
+
+    def test_missing_marker_is_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(cs.device_targets(Path(tmp)), {})
+
+    def test_write_device_targets_preserves_marker_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            write(repo / cs.MARKER_NAME, json.dumps({"format": "omarchy-config", "machine_local": ["omarchy/x.toml"]}) + "\n")
+            cs.write_device_targets(repo, {"hypr/monitors.lua": {"only": ["desktop"]}})
+            data = json.loads((repo / cs.MARKER_NAME).read_text(encoding="utf-8"))
+            self.assertEqual(data["machine_local"], ["omarchy/x.toml"])
+            self.assertEqual(data["synced_by"], cs.PLUGIN_ID)
+            self.assertEqual(data["sync_targets"], {"hypr/monitors.lua": {"only": ["desktop"]}})
+
+
+class DeviceTargetSyncTests(unittest.TestCase):
+    """End-to-end: rules in the marker decide what syncs on which device."""
+
+    def _as_host(self, name: str):
+        return patch.object(cs.socket, "gethostname", return_value=name)
+
+    def test_blocked_device_never_sees_or_syncs_the_file(self) -> None:
+        with TempHome() as env, self._as_host("laptop"):
+            repo = make_config_repo(env.home / "cfg")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            cs.cmd_targets(env.ctx, argparse_ns(args=["set", "hypr/monitors.lua"], only="desktop"))
+            snap = cs.cmd_snapshot(env.ctx, argparse_ns())
+            item = next(f for f in snap["diff"]["files"] if f["path"] == "hypr/monitors.lua")
+            self.assertEqual(item["device_state"], "blocked")
+            self.assertEqual(item["status"], "machine")
+            self.assertEqual(item["targets"], {"only": ["desktop"]})
+            # Even an explicit selection with include_machine cannot override the rule.
+            dry = cs.cmd_apply(env.ctx, argparse_ns(explicit=True, files="hypr/monitors.lua", include_machine=True))
+            self.assertEqual(dry["applied"], [])
+
+    def test_targeted_device_syncs_machine_local_file_without_toggle(self) -> None:
+        with TempHome() as env, self._as_host("desktop"):
+            repo = make_config_repo(env.home / "cfg")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            cs.cmd_targets(env.ctx, argparse_ns(args=["set", "hypr/monitors.lua"], only="desktop"))
+            snap = cs.cmd_snapshot(env.ctx, argparse_ns())
+            item = next(f for f in snap["diff"]["files"] if f["path"] == "hypr/monitors.lua")
+            self.assertEqual(item["device_state"], "included")
+            self.assertNotEqual(item["status"], "machine")
+            dry = cs.cmd_apply(env.ctx, argparse_ns(explicit=True, files="hypr/monitors.lua", include_machine=False))
+            self.assertEqual(dry["applied"], ["hypr/monitors.lua"])
+            self.assertTrue((env.home / ".config/hypr/monitors.lua").is_file())
+
+    def test_exclude_rule_blocks_one_device(self) -> None:
+        with TempHome() as env, self._as_host("laptop"):
+            repo = make_config_repo(env.home / "cfg")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            write(env.home / ".config" / "hypr" / "looknfeel.lua", "hl.decoration({ rounding = 12 })\n")
+            cs.cmd_targets(env.ctx, argparse_ns(args=["set", "hypr/looknfeel.lua"], exclude="laptop, other-box"))
+            snap = cs.cmd_snapshot(env.ctx, argparse_ns())
+            item = next(f for f in snap["diff"]["files"] if f["path"] == "hypr/looknfeel.lua")
+            self.assertEqual(item["device_state"], "blocked")
+            self.assertEqual(item["status"], "machine")
+            dry = cs.cmd_publish(env.ctx, argparse_ns(explicit=True, files="hypr/looknfeel.lua", dry_run=True))
+            self.assertEqual(dry["published"], [])
+
+    def test_clear_rule_restores_default_behavior(self) -> None:
+        with TempHome() as env, self._as_host("laptop"):
+            repo = make_config_repo(env.home / "cfg")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            cs.cmd_targets(env.ctx, argparse_ns(args=["set", "hypr/monitors.lua"], only="laptop"))
+            cs.cmd_targets(env.ctx, argparse_ns(args=["clear", "hypr/monitors.lua"]))
+            snap = cs.cmd_snapshot(env.ctx, argparse_ns())
+            item = next(f for f in snap["diff"]["files"] if f["path"] == "hypr/monitors.lua")
+            self.assertEqual(item["device_state"], "default")
+            self.assertEqual(item["status"], "machine")
+            dry = cs.cmd_apply(env.ctx, argparse_ns(explicit=True, files="hypr/monitors.lua", include_machine=True))
+            self.assertEqual(dry["applied"], ["hypr/monitors.lua"])
+
+    def test_targets_set_persists_rule_in_marker(self) -> None:
+        with TempHome() as env, self._as_host("laptop"):
+            repo = make_config_repo(env.home / "cfg")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            out = cs.cmd_targets(env.ctx, argparse_ns(args=["set", "hypr/monitors.lua"], only="desktop", exclude="laptop"))
+            self.assertEqual(out["targets"]["hypr/monitors.lua"], {"only": ["desktop"], "exclude": ["laptop"]})
+            marker = json.loads((repo / cs.MARKER_NAME).read_text(encoding="utf-8"))
+            self.assertEqual(marker["sync_targets"]["hypr/monitors.lua"], {"only": ["desktop"], "exclude": ["laptop"]})
+            # Both fields empty removes the rule.
+            out = cs.cmd_targets(env.ctx, argparse_ns(args=["set", "hypr/monitors.lua"]))
+            self.assertNotIn("hypr/monitors.lua", out["targets"])
+
+    def test_targets_rename_saves_device_name_and_survives_reconnect(self) -> None:
+        with TempHome() as env, self._as_host("testhost"):
+            repo = make_config_repo(env.home / "cfg")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            cs.cmd_targets(env.ctx, argparse_ns(args=["rename", "My Desk Top"]))
+            snap = cs.cmd_snapshot(env.ctx, argparse_ns())
+            self.assertEqual(snap["status"]["device_name"], "my desk top")
+            cs.cmd_targets(env.ctx, argparse_ns(args=["set", "hypr/monitors.lua"], only="my desk top"))
+            # Reconnect rebuilds state; the friendly name and the rule must both survive.
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            snap2 = cs.cmd_snapshot(env.ctx, argparse_ns())
+            item2 = next(f for f in snap2["diff"]["files"] if f["path"] == "hypr/monitors.lua")
+            self.assertEqual(item2["device_state"], "included")
+            self.assertEqual(snap2["status"]["device_name"], "my desk top")
+
+    def test_targets_list_reports_device_identity(self) -> None:
+        with TempHome() as env, self._as_host("testhost"):
+            repo = make_config_repo(env.home / "cfg")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            out = cs.cmd_targets(env.ctx, argparse_ns(args=[]))
+            self.assertEqual(out["device"]["hostname"], "testhost")
+            self.assertEqual(out["device"]["name"], "")
+            self.assertEqual(out["targets"], {})
+
+    def test_targets_rejects_unsafe_path_and_unknown_action(self) -> None:
+        with TempHome() as env, self._as_host("laptop"):
+            repo = make_config_repo(env.home / "cfg")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            with self.assertRaises(cs.SyncError):
+                cs.cmd_targets(env.ctx, argparse_ns(args=["set", "../etc/passwd"], only="desktop"))
+            with self.assertRaises(cs.SyncError):
+                cs.cmd_targets(env.ctx, argparse_ns(args=["bogus"]))
+
+    def test_portable_file_targeted_elsewhere_stays_invisible_here(self) -> None:
+        with TempHome() as env, self._as_host("laptop"):
+            repo = make_config_repo(env.home / "cfg")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            write(env.home / ".config" / "terminals" / "kitty.conf", "font_size 14\n")
+            cs.cmd_targets(env.ctx, argparse_ns(args=["set", "terminals/kitty.conf"], only="htpc"))
+            snap = cs.cmd_snapshot(env.ctx, argparse_ns())
+            item = next(f for f in snap["diff"]["files"] if f["path"] == "terminals/kitty.conf")
+            self.assertEqual(item["status"], "machine")
+            self.assertEqual(snap["status"]["local_changes"], 0)

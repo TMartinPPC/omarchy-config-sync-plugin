@@ -48,6 +48,9 @@ Panel {
   property var themeDiff: null
   property bool openOnChanges: false
   property bool showingHidden: false
+  property string targetsPath: ""
+  property bool editingDevice: false
+  property string deviceNameInput: ""
 
   readonly property bool configured: !!(status && status.configured)
   readonly property string reportedSyncState: String((status && status.sync_state) || (configured ? "in-sync" : "not-configured"))
@@ -103,7 +106,8 @@ Panel {
     for (var i = 0; i < diffFiles.length; i++) {
       var f = diffFiles[i]
       if (f.status === "identical" || f.status === "machine") continue
-      if (!includeMachine && !f.portable) continue
+      // A device rule that names this machine opts even machine-local files in.
+      if (!includeMachine && !f.portable && f.device_state !== "included") continue
       if (Model.isBundledPath(f.path)) continue
       if (f.group === "theme" && f.path !== "omarchy/theme.name") continue
       // Per-shortcut rows replace the whole bindings.lua file. If the parser
@@ -204,6 +208,40 @@ Panel {
 
   function unhideAll() {
     run(["unhide", "--all"])
+  }
+
+  function toggleTargetsEditor(path) {
+    targetsPath = (targetsPath === String(path)) ? "" : String(path)
+  }
+
+  function runTargetsSet(path, only, exclude) {
+    var args = ["targets", "set", String(path)]
+    if (String(only || "").trim()) args.push("--only", String(only).trim())
+    if (String(exclude || "").trim()) args.push("--exclude", String(exclude).trim())
+    run(args)
+  }
+
+  function runTargetsClear(path) {
+    run(["targets", "clear", String(path)])
+  }
+
+  function startEditDevice() {
+    deviceNameInput = String((status && (status.device_name || status.hostname)) || "")
+    editingDevice = true
+  }
+
+  function cancelEditDevice() {
+    editingDevice = false
+  }
+
+  function saveDeviceName() {
+    var name = String(deviceNameInput || "").trim()
+    if (!name) {
+      lastError = "Enter a name for this device, e.g. laptop or desktop."
+      return
+    }
+    editingDevice = false
+    run(["targets", "rename", name])
   }
 
   function refresh(fetch) {
@@ -771,6 +809,12 @@ Panel {
       return
     }
     lastMessage = String(data.message || "")
+    if (data.targets !== undefined && !data.status) {
+      // targets set/clear: the rule is saved; close the editor and re-snapshot
+      // so rows show the new rule and device_state.
+      targetsPath = ""
+      Qt.callLater(function() { refresh(false) })
+    }
     if (data.connected)
       editingRepo = false
     if (data.status || data.configured === false || data.disconnected)
@@ -1551,6 +1595,109 @@ Panel {
                 fontFamily: root.fontFamily
                 enabled: !root.busy
                 onClicked: root.cancelEditRepo()
+              }
+            }
+          }
+
+          Item {
+            width: parent.width
+            implicitHeight: Math.max(deviceLabelTxt.implicitHeight, deviceValTxt.implicitHeight, editDeviceBtn.implicitHeight)
+            visible: !root.editingDevice
+
+            Text {
+              id: deviceLabelTxt
+              textFormat: Text.PlainText
+              text: "Device"
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              anchors.left: parent.left
+              anchors.verticalCenter: parent.verticalCenter
+              width: Math.min(Style.space(140), parent.width * 0.28)
+            }
+            Text {
+              id: deviceValTxt
+              textFormat: Text.PlainText
+              text: {
+                var name = String((root.status && root.status.device_name) || "")
+                var host = String((root.status && root.status.hostname) || "")
+                if (name && host && name.toLowerCase() !== host.toLowerCase()) return name + " (" + host + ")"
+                return name || host || "—"
+              }
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              elide: Text.ElideMiddle
+              anchors.left: deviceLabelTxt.right
+              anchors.leftMargin: Style.space(8)
+              anchors.right: editDeviceBtn.left
+              anchors.rightMargin: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
+            }
+            Button {
+              id: editDeviceBtn
+              text: "Edit"
+              tooltipText: "Name this device so sync rules can target it, e.g. laptop or desktop"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              enabled: !root.busy
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              onClicked: root.startEditDevice()
+            }
+          }
+
+          Column {
+            visible: root.editingDevice
+            width: parent.width
+            spacing: Style.space(8)
+            onVisibleChanged: if (visible) deviceEditField.forceActiveFocus()
+
+            Text {
+              width: parent.width
+              textFormat: Text.PlainText
+              text: "Device name"
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+            TextField {
+              id: deviceEditField
+              width: parent.width
+              placeholderText: "laptop, desktop, htpc…"
+              text: root.deviceNameInput
+              foreground: root.foreground
+              font.family: root.fontFamily
+              enabled: !root.busy
+              onTextChanged: root.deviceNameInput = text
+              onAccepted: root.saveDeviceName()
+            }
+            Text {
+              width: parent.width
+              textFormat: Text.PlainText
+              text: "Per-device sync rules use this name (the hostname matches too). The name is stored on this machine only."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+            Row {
+              spacing: Style.space(8)
+              Button {
+                text: "Save"
+                bordered: true
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                enabled: !root.busy && String(root.deviceNameInput).trim() !== ""
+                onClicked: root.saveDeviceName()
+              }
+              Button {
+                text: "Cancel"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                enabled: !root.busy
+                onClicked: root.cancelEditDevice()
               }
             }
           }
@@ -2808,7 +2955,10 @@ Panel {
             pathLabel: modelData.path
             localPath: modelData.local_path || ""
             repoPath: modelData.repo_path || ""
-            summary: modelData.summary
+            summary: {
+              var hint = Model.targetHint(modelData.targets, modelData.device_state)
+              return hint ? modelData.summary + " · " + hint : String(modelData.summary || "")
+            }
             statusLabel: Model.fileStatusLabel(modelData.status, modelData.removal) + (modelData.portable ? "" : " · Machine-specific")
           }
         }
@@ -2964,205 +3114,238 @@ Panel {
     Repeater {
       model: sectionRoot.expanded ? files : []
 
-      Rectangle {
-        id: rowBox
+      Column {
+        id: rowSlot
         required property var modelData
         required property int index
-
-        readonly property string rowKind: sectionRoot.mixed ? String(modelData.kind || sectionRoot.kind) : sectionRoot.kind
-        readonly property string rowId: sectionRoot.mixed ? String(modelData.itemId || "") : String(modelData[sectionRoot.idField] || "")
-        readonly property string rowLabel: sectionRoot.mixed ? String(modelData.label || "") : String(modelData[sectionRoot.labelField] || "")
-        readonly property string rowSummary: {
-          if (sectionRoot.mixed) return String(modelData.summary || "")
-          var sum = String(modelData[sectionRoot.summaryField] || "")
-          if (sectionRoot.kind === "p")
-            sum = sum + " · " + String(modelData.changed_count || 0) + " files"
-          return sum
-        }
-        readonly property bool rowBoth: sectionRoot.mixed ? !!modelData.both : sectionRoot.both
-        readonly property bool included: !!(root.picks[root.pickId(rowKind, rowId)])
-        readonly property string bothKey: rowKind === "f" ? rowId : (rowKind + ":" + rowId)
-        readonly property string typeLabel: sectionRoot.mixed ? String(modelData.typeLabel || "") : ""
-        readonly property bool pickable: modelData.pickable !== false
-        readonly property string rowAction: String(modelData.action || "")
-
         width: sectionRoot.width
-        implicitHeight: rowInner.implicitHeight + Style.space(16)
-        radius: Style.cornerRadius
-        color: included ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.12) : root.cardBg
-        border.width: 2
-        border.color: included ? root.accent : root.foreground
+        spacing: Style.space(4)
 
-        Row {
-          id: rowInner
-          anchors.left: parent.left
-          anchors.right: parent.right
-          anchors.verticalCenter: parent.verticalCenter
-          anchors.leftMargin: Style.space(10)
-          anchors.rightMargin: Style.space(10)
-          spacing: Style.space(10)
+        Rectangle {
+          id: rowBox
+          readonly property var modelData: rowSlot.modelData
+          readonly property int index: rowSlot.index
 
-          Rectangle {
-            width: 28
-            height: 28
-            radius: 4
-            anchors.verticalCenter: parent.verticalCenter
-            visible: rowBox.pickable
-            color: rowBox.included ? root.accent : Color.background
-            border.width: 2
-            border.color: root.foreground
-
-            Text {
-              textFormat: Text.PlainText
-              anchors.centerIn: parent
-              text: rowBox.included ? "✓" : ""
-              color: Color.background
-              font.family: root.fontFamily
-              font.pixelSize: 18
-              font.bold: true
-            }
-
-            MouseArea {
-              anchors.fill: parent
-              cursorShape: Qt.PointingHandCursor
-              onClicked: root.togglePick(rowBox.rowKind, rowBox.rowId)
-            }
+          readonly property string rowKind: sectionRoot.mixed ? String(modelData.kind || sectionRoot.kind) : sectionRoot.kind
+          readonly property string rowId: sectionRoot.mixed ? String(modelData.itemId || "") : String(modelData[sectionRoot.idField] || "")
+          readonly property string rowLabel: sectionRoot.mixed ? String(modelData.label || "") : String(modelData[sectionRoot.labelField] || "")
+          readonly property string rowSummary: {
+            if (sectionRoot.mixed) return String(modelData.summary || "")
+            var sum = String(modelData[sectionRoot.summaryField] || "")
+            if (sectionRoot.kind === "p")
+              sum = sum + " · " + String(modelData.changed_count || 0) + " files"
+            return sum
           }
+          readonly property bool rowBoth: sectionRoot.mixed ? !!modelData.both : sectionRoot.both
+          readonly property bool included: !!(root.picks[root.pickId(rowKind, rowId)])
+          readonly property string bothKey: rowKind === "f" ? rowId : (rowKind + ":" + rowId)
+          readonly property string typeLabel: sectionRoot.mixed ? String(modelData.typeLabel || "") : ""
+          readonly property bool pickable: modelData.pickable !== false
+          readonly property string rowAction: String(modelData.action || "")
+          readonly property string targetHint: rowKind === "f" ? Model.targetHint(modelData.targets, modelData.deviceState) : ""
 
-          Column {
-            width: parent.width - (rowBox.pickable ? 28 + includeBtn.width : 0) - (actionBtn.visible ? actionBtn.width : 0) - hideBtn.width - (rowBox.rowBoth ? 168 : 0) - parent.spacing * (1 + (rowBox.pickable ? 2 : 0) + (actionBtn.visible ? 1 : 0) + (rowBox.rowBoth ? 1 : 0))
-            spacing: 2
+          width: parent.width
+          implicitHeight: rowInner.implicitHeight + Style.space(16)
+          radius: Style.cornerRadius
+          color: included ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.12) : root.cardBg
+          border.width: 2
+          border.color: included ? root.accent : root.foreground
+
+          Row {
+            id: rowInner
+            anchors.left: parent.left
+            anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
+            anchors.leftMargin: Style.space(10)
+            anchors.rightMargin: Style.space(10)
+            spacing: Style.space(10)
 
-            Text {
-              width: parent.width
-              textFormat: Text.PlainText
-              text: (rowBox.typeLabel ? rowBox.typeLabel + "  ·  " : "") + rowBox.rowLabel
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.body
-              font.bold: true
-              wrapMode: Text.WordWrap
-            }
-            Text {
-              width: parent.width
-              textFormat: Text.PlainText
-              text: {
-                var st = Model.fileStatusLabel(rowBox.modelData.status, rowBox.modelData.removal)
-                var sum = rowBox.rowSummary
-                var verb = rowBox.modelData.removal ? " · will delete" : " · will sync"
-                if (!rowBox.pickable) return Model.statusPrefix(st, sum) + sum
-                return Model.statusPrefix(st, sum) + sum + (rowBox.included ? verb : " · skipped")
+            Rectangle {
+              width: 28
+              height: 28
+              radius: 4
+              anchors.verticalCenter: parent.verticalCenter
+              visible: rowBox.pickable
+              color: rowBox.included ? root.accent : Color.background
+              border.width: 2
+              border.color: root.foreground
+
+              Text {
+                textFormat: Text.PlainText
+                anchors.centerIn: parent
+                text: rowBox.included ? "✓" : ""
+                color: Color.background
+                font.family: root.fontFamily
+                font.pixelSize: 18
+                font.bold: true
               }
-              color: root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.WordWrap
+
+              MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.togglePick(rowBox.rowKind, rowBox.rowId)
+              }
             }
 
-            Flow {
-              visible: rowBox.modelData && rowBox.modelData.changes && rowBox.modelData.changes.length > 0
-              width: parent.width
-              spacing: Style.space(4)
-              Repeater {
-                model: (rowBox.modelData && rowBox.modelData.changes) ? rowBox.modelData.changes : []
-                Rectangle {
-                  radius: Style.cornerRadius > 0 ? Style.space(4) : 2
-                  color: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.15)
-                  border.width: 1
-                  border.color: root.accent
-                  implicitWidth: Math.min(parent.width, changeText.implicitWidth + Style.space(10))
-                  implicitHeight: changeText.implicitHeight + Style.space(4)
-                  Text {
-                    id: changeText
-                    anchors.centerIn: parent
-                    width: Math.max(0, parent.width - Style.space(10))
-                    wrapMode: Text.Wrap
-                    textFormat: Text.PlainText
-                    text: String(modelData)
-                    color: root.foreground
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                    font.bold: true
+            Column {
+              width: parent.width - (rowBox.pickable ? 28 + includeBtn.width : 0) - (actionBtn.visible ? actionBtn.width : 0) - hideBtn.width - (targetsBtn.visible ? targetsBtn.width : 0) - (rowBox.rowBoth ? 168 : 0) - parent.spacing * (1 + (rowBox.pickable ? 2 : 0) + (actionBtn.visible ? 1 : 0) + (targetsBtn.visible ? 1 : 0) + (rowBox.rowBoth ? 1 : 0))
+              spacing: 2
+              anchors.verticalCenter: parent.verticalCenter
+
+              Text {
+                width: parent.width
+                textFormat: Text.PlainText
+                text: (rowBox.typeLabel ? rowBox.typeLabel + "  ·  " : "") + rowBox.rowLabel
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                font.bold: true
+                wrapMode: Text.WordWrap
+              }
+              Text {
+                width: parent.width
+                textFormat: Text.PlainText
+                text: {
+                  var st = Model.fileStatusLabel(rowBox.modelData.status, rowBox.modelData.removal)
+                  var sum = rowBox.rowSummary
+                  var verb = rowBox.modelData.removal ? " · will delete" : " · will sync"
+                  var hint = rowBox.targetHint ? " · " + rowBox.targetHint : ""
+                  if (!rowBox.pickable) return Model.statusPrefix(st, sum) + sum + hint
+                  return Model.statusPrefix(st, sum) + sum + hint + (rowBox.included ? verb : " · skipped")
+                }
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
+
+              Flow {
+                visible: rowBox.modelData && rowBox.modelData.changes && rowBox.modelData.changes.length > 0
+                width: parent.width
+                spacing: Style.space(4)
+                Repeater {
+                  model: (rowBox.modelData && rowBox.modelData.changes) ? rowBox.modelData.changes : []
+                  Rectangle {
+                    radius: Style.cornerRadius > 0 ? Style.space(4) : 2
+                    color: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.15)
+                    border.width: 1
+                    border.color: root.accent
+                    implicitWidth: Math.min(parent.width, changeText.implicitWidth + Style.space(10))
+                    implicitHeight: changeText.implicitHeight + Style.space(4)
+                    Text {
+                      id: changeText
+                      anchors.centerIn: parent
+                      width: Math.max(0, parent.width - Style.space(10))
+                      wrapMode: Text.Wrap
+                      textFormat: Text.PlainText
+                      text: String(modelData)
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                    }
                   }
                 }
               }
             }
-          }
 
-          Row {
-            visible: rowBox.rowBoth && rowBox.pickable
-            spacing: Style.space(4)
-            anchors.verticalCenter: parent.verticalCenter
+            Row {
+              visible: rowBox.rowBoth && rowBox.pickable
+              spacing: Style.space(4)
+              anchors.verticalCenter: parent.verticalCenter
+              Button {
+                text: "Keep local"
+                fontSize: Style.font.caption
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                selected: root.bothPicks[rowBox.bothKey] === "local"
+                bordered: true
+                onClicked: root.selectSide(rowBox.rowKind, rowBox.rowId, "local")
+              }
+              Button {
+                text: "Take repo"
+                fontSize: Style.font.caption
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                selected: root.bothPicks[rowBox.bothKey] === "repo"
+                bordered: true
+                onClicked: root.selectSide(rowBox.rowKind, rowBox.rowId, "repo")
+              }
+            }
+
             Button {
-              text: "Keep local"
-              fontSize: Style.font.caption
+              id: actionBtn
+              visible: rowBox.rowAction !== ""
+              text: Model.pluginActionLabel(rowBox.rowAction)
+              iconText: Model.pluginActionIcon(rowBox.rowAction)
+              tooltipText: Model.pluginActionTip(rowBox.rowAction)
+              bordered: true
               foreground: root.foreground
               fontFamily: root.fontFamily
-              selected: root.bothPicks[rowBox.bothKey] === "local"
-              bordered: true
-              onClicked: root.selectSide(rowBox.rowKind, rowBox.rowId, "local")
-            }
-            Button {
-              text: "Take repo"
               fontSize: Style.font.caption
+              anchors.verticalCenter: parent.verticalCenter
+              enabled: !root.busy
+              onClicked: root.runPluginAction(rowBox.rowAction, rowBox.rowId)
+            }
+
+            Button {
+              id: includeBtn
+              visible: rowBox.pickable
+              text: rowBox.included ? "Included" : "Skip"
+              selected: rowBox.included
+              bordered: true
               foreground: root.foreground
               fontFamily: root.fontFamily
-              selected: root.bothPicks[rowBox.bothKey] === "repo"
+              fontSize: Style.font.caption
+              anchors.verticalCenter: parent.verticalCenter
+              onClicked: root.togglePick(rowBox.rowKind, rowBox.rowId)
+            }
+
+            Button {
+              id: targetsBtn
+              visible: rowBox.rowKind === "f"
+              text: rowBox.targetHint ? "Targets ●" : "Targets"
+              iconText: "󰓅"
+              tooltipText: "Choose which devices this file syncs to"
               bordered: true
-              onClicked: root.selectSide(rowBox.rowKind, rowBox.rowId, "repo")
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              selected: root.targetsPath === rowBox.rowId
+              anchors.verticalCenter: parent.verticalCenter
+              enabled: !root.busy
+              onClicked: root.toggleTargetsEditor(rowBox.rowId)
+            }
+
+            Button {
+              id: hideBtn
+              text: "Hide"
+              iconText: "󰈉"
+              tooltipText: "Hide this change so it doesn't bother you"
+              bordered: true
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              anchors.verticalCenter: parent.verticalCenter
+              enabled: !root.busy
+              onClicked: root.hideItem(rowBox.rowKind, rowBox.rowId)
             }
           }
 
-          Button {
-            id: actionBtn
-            visible: rowBox.rowAction !== ""
-            text: Model.pluginActionLabel(rowBox.rowAction)
-            iconText: Model.pluginActionIcon(rowBox.rowAction)
-            tooltipText: Model.pluginActionTip(rowBox.rowAction)
-            bordered: true
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            fontSize: Style.font.caption
-            anchors.verticalCenter: parent.verticalCenter
-            enabled: !root.busy
-            onClicked: root.runPluginAction(rowBox.rowAction, rowBox.rowId)
-          }
-
-          Button {
-            id: includeBtn
-            visible: rowBox.pickable
-            text: rowBox.included ? "Included" : "Skip"
-            selected: rowBox.included
-            bordered: true
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            fontSize: Style.font.caption
-            anchors.verticalCenter: parent.verticalCenter
+          MouseArea {
+            z: -1
+            anchors.fill: parent
+            enabled: rowBox.pickable
+            cursorShape: Qt.PointingHandCursor
             onClicked: root.togglePick(rowBox.rowKind, rowBox.rowId)
-          }
-
-          Button {
-            id: hideBtn
-            text: "Hide"
-            iconText: "󰈉"
-            tooltipText: "Hide this change so it doesn't bother you"
-            bordered: true
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            fontSize: Style.font.caption
-            anchors.verticalCenter: parent.verticalCenter
-            enabled: !root.busy
-            onClicked: root.hideItem(rowBox.rowKind, rowBox.rowId)
           }
         }
 
-        MouseArea {
-          z: -1
-          anchors.fill: parent
-          enabled: rowBox.pickable
-          cursorShape: Qt.PointingHandCursor
-          onClicked: root.togglePick(rowBox.rowKind, rowBox.rowId)
+        TargetsEditor {
+          width: parent.width
+          visible: rowBox.rowKind === "f" && root.targetsPath === rowBox.rowId
+          path: rowBox.rowId
+          rule: rowBox.modelData.targets
         }
       }
     }
@@ -3434,6 +3617,113 @@ Panel {
             cursorShape: Qt.PointingHandCursor
             onClicked: root.openTerminal(fileRowRoot.pathLabel, fileRowRoot.localPath, fileRowRoot.repoPath)
           }
+        }
+      }
+    }
+  }
+
+  component TargetsEditor: Rectangle {
+    id: targetsRoot
+    property string path: ""
+    property var rule: null
+    readonly property string ruleOnly: rule && rule.only ? rule.only.join(", ") : ""
+    readonly property string ruleExclude: rule && rule.exclude ? rule.exclude.join(", ") : ""
+    readonly property string deviceLabel: {
+      var name = String((root.status && root.status.device_name) || "")
+      if (!name) name = String((root.status && root.status.hostname) || "this device")
+      return name
+    }
+    width: parent ? parent.width : 100
+    implicitHeight: targetsCol.implicitHeight + Style.space(16)
+    radius: Style.cornerRadius
+    color: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.06)
+    border.width: 1
+    border.color: root.accent
+
+    onVisibleChanged: {
+      if (!visible) return
+      targetsOnlyField.text = targetsRoot.ruleOnly
+      targetsExcludeField.text = targetsRoot.ruleExclude
+      targetsOnlyField.forceActiveFocus()
+    }
+
+    Column {
+      id: targetsCol
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.leftMargin: Style.space(10)
+      anchors.rightMargin: Style.space(10)
+      spacing: Style.space(6)
+
+      Text {
+        width: parent.width
+        textFormat: Text.PlainText
+        text: "Sync targets — " + targetsRoot.path
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+        font.bold: true
+        elide: Text.ElideMiddle
+      }
+      Text {
+        width: parent.width
+        textFormat: Text.PlainText
+        text: "Limit which devices this file syncs to. This device is '" + targetsRoot.deviceLabel + "' (rename it on the Overview tab). Leave both fields empty to sync everywhere."
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+      }
+      TextField {
+        id: targetsOnlyField
+        width: parent.width
+        placeholderText: "Sync only to (comma separated, empty = all devices)"
+        foreground: root.foreground
+        font.family: root.fontFamily
+        enabled: !root.busy
+        onAccepted: root.runTargetsSet(targetsRoot.path, targetsOnlyField.text, targetsExcludeField.text)
+      }
+      TextField {
+        id: targetsExcludeField
+        width: parent.width
+        placeholderText: "Never sync to (comma separated)"
+        foreground: root.foreground
+        font.family: root.fontFamily
+        enabled: !root.busy
+        onAccepted: root.runTargetsSet(targetsRoot.path, targetsOnlyField.text, targetsExcludeField.text)
+      }
+      Row {
+        spacing: Style.space(6)
+        Button {
+          text: "Save targets"
+          iconText: "󰓂"
+          bordered: true
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          fontSize: Style.font.caption
+          enabled: !root.busy
+          onClicked: root.runTargetsSet(targetsRoot.path, targetsOnlyField.text, targetsExcludeField.text)
+        }
+        Button {
+          visible: targetsRoot.rule !== null
+          text: "Remove rule"
+          iconText: "󰆴"
+          bordered: true
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          fontSize: Style.font.caption
+          enabled: !root.busy
+          onClicked: root.runTargetsClear(targetsRoot.path)
+        }
+        Button {
+          text: "Cancel"
+          bordered: true
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          fontSize: Style.font.caption
+          enabled: !root.busy
+          onClicked: root.targetsPath = ""
         }
       }
     }

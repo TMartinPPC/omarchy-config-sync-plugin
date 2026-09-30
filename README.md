@@ -28,7 +28,7 @@ When there is drift, **Review Changes** opens a checklist: incoming vs local **s
 - **Publish** copies this machine → repo, commits, and pushes so the next machine can Apply.
 - **Drift detection** on open (and every 10 minutes): local-only edits, incoming remote files, both-changed files, and git merge conflicts.
 - **Conflict handling**: per-file Keep local / Take repo for overlapping edits; Keep local / Take incoming for git merge conflicts. Display layout (`hypr/monitors.lua`) stays on this machine unless you opt in.
-- **Per-device targets**: name each device, then limit any file — or the theme as a whole — to chosen devices ("only sync monitors.lua to desktop") or block it on some ("never sync shell.toml to work-laptop").
+- **Per-device targets**: name each device, then limit any file, shortcut, or the theme to chosen devices ("only sync monitors.lua to desktop") or block it on some ("never sync shell.toml to work-laptop").
 
 ## Install
 
@@ -104,20 +104,22 @@ Name each machine (Overview → Device → Edit), then open a row's **Targets** 
 {
   "sync_targets": {
     "hypr/monitors.lua": { "only": ["desktop", "htpc"] },
-    "omarchy/shell.toml": { "exclude": ["work-laptop"] },
-    "omarchy/theme.name": { "only": ["desktop", "laptop"] }
+    "omarchy/shell.toml": { "exclude": ["work-laptop"] }
+  },
+  "sync_shortcuts": {
+    "SUPER + SHIFT + R": { "only": ["desktop"] }
   }
 }
 ```
 
 - `only` — syncs only to the listed devices; `exclude` — never syncs on the listed devices.
 - A device matches its friendly name or its hostname, case-insensitive.
-- **Files** are ruled by exact repo path. The **theme** is one unit: a rule on `omarchy/theme.name` covers the selected theme plus its custom overlay files.
+- **Files** are ruled by exact repo path. **Shortcuts** are ruled per keybinding (keys are matched ignoring case and extra spaces). The **theme** is one unit: a rule on `omarchy/theme.name` covers the selected theme plus its custom overlay files.
 - A rule opts matching devices in: even machine-local files like `hypr/monitors.lua` sync there without the **Include machine-local files** toggle.
 - On blocked devices the row is invisible: it never counts as drift and cannot be applied or published even by explicit selection.
 - Rule changes commit and push the marker immediately; if the push fails, the rule rides along with the next Publish.
 
-The same controls exist on the CLI: `config_sync.py targets` lists rules, `targets set <path> --only a,b --exclude c`, `targets clear <path>`, and `targets rename <name>` sets this device's friendly name.
+The same controls exist on the CLI: `config_sync.py targets` lists rules, `targets set <path> --only a,b --exclude c`, `targets set --shortcut "SUPER + SHIFT + R" --only desktop`, `targets clear <path>` (or `--shortcut "…"`), and `targets rename <name>` sets this device's friendly name.
 
 Shortcut cherry-pick copies one `o.bind` / `o.rebind` / `hl.unbind` line at a time. A command that is a string, a number, `os.getenv(...)`, or `hl.dsp.*` is portable. If the command only works because of a `local` defined elsewhere in `bindings.lua` (a helper function, an undefined name, …), that shortcut is listed with a skip reason and is **not** copied — applying it would abort Hyprland's `require("hypr.bindings")` on the other machine. Path locals such as `local snap = os.getenv("HOME") .. "/.local/bin/hypr-quarter-snap"` are inlined into a self-contained command when publishing. Helper scripts those bindings, hooks, or plugins reference are offered under **Helper scripts** (the rest of `~/.local/bin` is left alone). Apply restores the execute bit on plugin shebang scripts and ELF binaries (`radio-fetch`, `scripts/audio-*`, …) so Qt/QML `Process` can start them. Theme scripts still land non-executable.
 

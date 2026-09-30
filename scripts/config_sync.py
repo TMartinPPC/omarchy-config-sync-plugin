@@ -710,6 +710,61 @@ def write_device_targets(repo: Path, targets: dict[str, dict[str, list[str]]]) -
     write_json(marker_path, data, within=repo)
 
 
+# Per-shortcut rules live in their own marker map: keys are normalized bind
+# strings ("super + shift + r"), not repo paths, and one rule governs the
+# cherry-picked binding on every machine.
+SHORTCUT_TARGETS_KEY = "sync_shortcuts"
+MAX_SHORTCUT_TARGETS = 512
+
+
+def normalize_keys(keys: Any) -> str | None:
+    text = " ".join(str(keys or "").split()).lower()
+    return text or None
+
+
+def shortcut_targets(repo: Path | None) -> dict[str, dict[str, list[str]]]:
+    """Read the marker's sync_shortcuts map, dropping anything malformed."""
+    if repo is None:
+        return {}
+    marker = load_json(repo / MARKER_NAME, default={}, within=repo)
+    raw = marker.get(SHORTCUT_TARGETS_KEY) if isinstance(marker, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+    targets: dict[str, dict[str, list[str]]] = {}
+    for keys, rule in list(raw.items())[:MAX_SHORTCUT_TARGETS]:
+        normalized = normalize_keys(keys)
+        if not normalized or not isinstance(rule, dict):
+            continue
+        only = parse_device_list(rule.get("only"))
+        exclude = parse_device_list(rule.get("exclude"))
+        if not only and not exclude:
+            continue
+        entry: dict[str, list[str]] = {}
+        if only:
+            entry["only"] = only
+        if exclude:
+            entry["exclude"] = exclude
+        targets[normalized] = entry
+    return targets
+
+
+def write_device_rules(
+    repo: Path,
+    targets: dict[str, dict[str, list[str]]] | None = None,
+    shortcuts: dict[str, dict[str, list[str]]] | None = None,
+) -> None:
+    """Persist file rules and/or shortcut rules. None leaves that map alone."""
+    write_marker(repo)
+    marker_path = repo / MARKER_NAME
+    data = load_json(marker_path, default={}, within=repo)
+    data = data if isinstance(data, dict) else {}
+    if targets is not None:
+        data[SYNC_TARGETS_KEY] = targets
+    if shortcuts is not None:
+        data[SHORTCUT_TARGETS_KEY] = shortcuts
+    write_json(marker_path, data, within=repo)
+
+
 def read_source_argument(args: argparse.Namespace) -> str:
     """Collect the repo URL/path for connect and set-url.
 
@@ -3590,6 +3645,18 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
         local_within=ctx.home,
         repo_within=repo,
     )
+    shortcut_rules = shortcut_targets(repo)
+    shortcut_names = device_names(ctx)
+    for s in shortcuts:
+        keys = normalize_keys(s["keys"])
+        s["targets"] = shortcut_rules.get(keys) if keys else None
+        s["device_state"] = device_target_state(keys or "", shortcut_rules, shortcut_names)
+        if s["device_state"] == "blocked":
+            # Same contract as blocked files: invisible drift on this device,
+            # never a default pick, never applied even when asked for.
+            s["status"] = "machine"
+            s["default_apply"] = False
+            s["default_publish"] = False
     for s in shortcuts:
         s["hidden"] = is_hidden_item("s", s["keys"], hidden_keys)
     drop_bindings_file_without_shortcut_diffs(files, counts, shortcuts)
@@ -3671,7 +3738,7 @@ def drop_bindings_file_without_shortcut_diffs(
     the Changes list is per-shortcut. Counting that file as incoming left the
     header on "Incoming updates" with an empty review list.
     """
-    if any(not s.get("hidden") for s in shortcuts):
+    if any(not s.get("hidden") and s.get("device_state") != "blocked" for s in shortcuts):
         return
     for item in files:
         if item.get("path") != "hypr/bindings.lua":
@@ -3774,7 +3841,7 @@ def build_snapshot(ctx: Context, fetch: bool = False) -> dict[str, Any]:
         "repo_changes": diff["counts"].get("repo", 0) + diff["counts"].get("added-repo", 0),
         "both_changed": diff["counts"].get("both", 0),
         "unknown_differs": diff["counts"].get("differs", 0),
-        "shortcut_changes": len([s for s in (diff.get("shortcuts") or []) if not s.get("hidden")]),
+        "shortcut_changes": len([s for s in (diff.get("shortcuts") or []) if not s.get("hidden") and s.get("device_state") != "blocked"]),
         "plugin_changes": len([p for p in (diff.get("plugins") or []) if not p.get("hidden")]),
         "plugin_list_changes": len([p for p in (diff.get("plugin_list") or []) if not p.get("hidden")]),
         "hidden": state.get("hidden") or [],
@@ -4283,6 +4350,10 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         extra_theme = expand_theme_paths(diff["files"], "apply")
         wanted = set() if wanted is None else set(wanted)
         wanted |= extra_theme
+    # Blocked shortcuts never move on this device, even when named explicitly.
+    blocked_keys = {s["keys"] for s in diff["shortcuts"] if s.get("device_state") == "blocked"}
+    if blocked_keys:
+        shortcut_keys = [k for k in shortcut_keys if normalize_keys(k) not in {normalize_keys(b) for b in blocked_keys}]
     requested_shortcuts = list(shortcut_keys)
     skipped_shortcuts: list[dict[str, str]] = []
     if shortcut_keys:
@@ -4503,6 +4574,10 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         extra_theme = expand_theme_paths(diff["files"], "publish")
         wanted = set() if wanted is None else set(wanted)
         wanted |= extra_theme
+    # Blocked shortcuts never move on this device, even when named explicitly.
+    blocked_keys = {s["keys"] for s in diff["shortcuts"] if s.get("device_state") == "blocked"}
+    if blocked_keys:
+        shortcut_keys = [k for k in shortcut_keys if normalize_keys(k) not in {normalize_keys(b) for b in blocked_keys}]
     requested_shortcuts = list(shortcut_keys)
     skipped_shortcuts: list[dict[str, str]] = []
     if shortcut_keys:
@@ -4732,7 +4807,7 @@ def cmd_resync(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     shortcuts = [
         item["keys"]
         for item in (diff.get("shortcuts") or [])
-        if not item.get("hidden") and item.get("status") in wanted_status
+        if not item.get("hidden") and item.get("status") in wanted_status and item.get("device_state") != "blocked"
     ]
     plugins = [
         item["plugin_id"]
@@ -5113,14 +5188,19 @@ def cmd_targets(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     """Manage per-device sync rules and this device's friendly name.
 
     targets              — list rules and this device's identity
-    targets set <path> [--only a,b] [--exclude c,d]   — upsert; empty lists clear a side
-    targets clear <path> — drop the rule
+    targets set <path> [--only a,b] [--exclude c,d]   — upsert a file rule
+    targets set --shortcut "<keys>" [--only a,b] [--exclude c,d] — upsert a shortcut rule
+    targets clear <path> | targets clear --shortcut "<keys>" — drop a rule
     targets rename <name> — save a friendly device_name in this machine's state
+
+    A rule on omarchy/theme.name governs the whole theme (selection plus its
+    custom overlay files).
     """
     state = load_state(ctx)
     repo = configured_repo(ctx, state)
     sub = str((args.args[0] if args.args else "list")).strip().lower()
     rest = args.args[1:]
+    keys_raw = next((k for k in (getattr(args, "shortcut", None) or []) if k), None)
 
     if sub == "rename":
         raw = " ".join(rest).strip() or str(getattr(args, "name", "") or "").strip()
@@ -5133,12 +5213,11 @@ def cmd_targets(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         snap["message"] = f"This device is now '{name}'."
         return snap
 
-    targets = device_targets(repo)
-
     if sub == "list":
         return ok(
             {
-                "targets": targets,
+                "targets": device_targets(repo),
+                "shortcuts": shortcut_targets(repo),
                 "device": {"hostname": socket.gethostname(), "name": str(state.get("device_name") or "")},
                 "marker": str(repo / MARKER_NAME),
             }
@@ -5147,7 +5226,7 @@ def cmd_targets(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     if sub not in {"set", "clear"}:
         raise SyncError("Unknown targets action. Use list, set, clear, or rename.")
 
-    # A rule change is a commit in the clone. Never build on a conflicted or
+# A rule change is a commit in the clone. Never build on a conflicted or
     # outdated base — the same conditions Publish refuses under — so the
     # marker can never be committed with conflict markers in it.
     fetch_error = fetch_repo(repo)
@@ -5165,26 +5244,48 @@ def cmd_targets(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
             extra={"ahead": git_fields["ahead"], "behind": git_fields["behind"]},
         )
 
-    rel = str(rest[0] if rest else getattr(args, "files", "") or "").strip()
-    if not validate_safe_rel_path(rel):
-        raise SyncError("Pass the repo-relative path the rule is about, for example hypr/monitors.lua.")
-
-    if sub == "set":
-        only = parse_device_list(getattr(args, "only", None))
-        exclude = parse_device_list(getattr(args, "exclude", None))
-        if not only and not exclude:
-            targets.pop(rel, None)
+    if keys_raw:
+        keys = normalize_keys(keys_raw)
+        if not keys:
+            raise SyncError('Pass the shortcut keys exactly as shown in the panel, e.g. "SUPER + SHIFT + R".')
+        subject = f"shortcut {keys}"
+        shortcuts = shortcut_targets(repo)
+        if sub == "set":
+            only = parse_device_list(getattr(args, "only", None))
+            exclude = parse_device_list(getattr(args, "exclude", None))
+            if not only and not exclude:
+                shortcuts.pop(keys, None)
+            else:
+                rule: dict[str, list[str]] = {}
+                if only:
+                    rule["only"] = only
+                if exclude:
+                    rule["exclude"] = exclude
+                shortcuts[keys] = rule
         else:
-            rule: dict[str, list[str]] = {}
-            if only:
-                rule["only"] = only
-            if exclude:
-                rule["exclude"] = exclude
-            targets[rel] = rule
+            shortcuts.pop(keys, None)
+        write_device_rules(repo, shortcuts=shortcuts)
     else:
-        targets.pop(rel, None)
-
-    write_device_targets(repo, targets)
+        rel = str(rest[0] if rest else getattr(args, "files", "") or "").strip()
+        if not validate_safe_rel_path(rel):
+            raise SyncError("Pass the repo-relative path the rule is about, for example hypr/monitors.lua.")
+        subject = rel
+        targets = device_targets(repo)
+        if sub == "set":
+            only = parse_device_list(getattr(args, "only", None))
+            exclude = parse_device_list(getattr(args, "exclude", None))
+            if not only and not exclude:
+                targets.pop(rel, None)
+            else:
+                rule: dict[str, list[str]] = {}
+                if only:
+                    rule["only"] = only
+                if exclude:
+                    rule["exclude"] = exclude
+                targets[rel] = rule
+        else:
+            targets.pop(rel, None)
+        write_device_targets(repo, targets)
 
     # Rules only matter once other machines can read them: commit the marker
     # and push so the next Apply on another device honors the change. A failed
@@ -5196,7 +5297,7 @@ def cmd_targets(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     if dirty:
         ensure_git_identity(repo)
         run_git(repo, ["add", MARKER_NAME], check=True)
-        result = run_git(repo, ["commit", "-m", f"Update sync targets for {rel}"], timeout=30)
+        result = run_git(repo, ["commit", "-m", f"Update sync targets for {subject}"], timeout=30)
         if result.returncode == 0:
             committed = True
     result = run_git(repo, ["push", "-u", "origin", "HEAD"], timeout=PUSH_TIMEOUT)
@@ -5206,7 +5307,8 @@ def cmd_targets(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         push_error = git_error_message(["push"], result)
 
     payload = {
-        "targets": targets,
+        "targets": device_targets(repo),
+        "shortcuts": shortcut_targets(repo),
         "device": {"hostname": socket.gethostname(), "name": str(state.get("device_name") or "")},
         "committed": committed,
         "pushed": pushed,

@@ -262,6 +262,9 @@ function isItemHidden(kind, id, hiddenMap, item) {
 function hasVisibleShortcutDiffs(shortcuts, hiddenMap) {
   var list = shortcuts || []
   for (var i = 0; i < list.length; i++) {
+    // Shortcuts blocked on this device by a sync-target rule are not real
+    // diffs here; they must not keep the whole bindings.lua row visible.
+    if (String(list[i].device_state || "") === "blocked") continue
     if (isItemHidden("s", list[i].keys, hiddenMap, list[i])) continue
     return true
   }
@@ -294,6 +297,8 @@ function appendShortcuts(out, list, summaryField, both, hiddenMap) {
     // cherry-picked safely. Keep them visible as an explanation without
     // presenting an Include control that the backend would silently ignore.
     row.pickable = s.portable !== false
+    row.targets = s.targets || null
+    row.deviceState = String(s.device_state || "default")
     out.push(row)
   }
 }

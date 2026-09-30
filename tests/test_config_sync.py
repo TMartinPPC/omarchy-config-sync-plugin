@@ -3503,7 +3503,7 @@ class ShortcutThemeTargetTests(unittest.TestCase):
             dry = cs.cmd_apply(env.ctx, argparse_ns(theme=True, dry_run=True))
             self.assertIn("omarchy/theme.name", dry["applied"])
 
-def test_targets_list_and_clear_shortcut_rules(self) -> None:
+    def test_targets_list_and_clear_shortcut_rules(self) -> None:
         with TempHome() as env, self._as_host("laptop"):
             repo = make_config_repo(env.home / "cfg")
             cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
@@ -3515,6 +3515,36 @@ def test_targets_list_and_clear_shortcut_rules(self) -> None:
             cs.cmd_targets(env.ctx, argparse_ns(args=["clear"], shortcut=["super + SHIFT + R"]))
             out = cs.cmd_targets(env.ctx, argparse_ns(args=[]))
             self.assertEqual(out["shortcuts"], {})
+
+    def test_whole_file_bindings_apply_refused_with_blocked_shortcuts(self) -> None:
+        with TempHome() as env, self._as_host("laptop"):
+            repo = make_config_repo(env.home / "cfg")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            cs.cmd_targets(env.ctx, argparse_ns(args=["set"], shortcut=["SUPER + SHIFT + R"], only="desktop"))
+            with self.assertRaises(cs.SyncError) as cm:
+                cs.cmd_apply(env.ctx, argparse_ns(explicit=True, files="hypr/bindings.lua", dry_run=True))
+            self.assertIn("blocked on this device", str(cm.exception))
+            self.assertIn("SUPER + SHIFT + R", str(cm.exception))
+
+    def test_whole_file_bindings_publish_refused_with_blocked_shortcuts(self) -> None:
+        with TempHome() as env, self._as_host("laptop"):
+            repo = make_config_repo(env.home / "cfg")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            write(env.home / ".config" / "hypr" / "bindings.lua", 'o.bind("SUPER + SHIFT + R", "Region recording", "screenrecord-region-toggle-v2")\n')
+            cs.cmd_targets(env.ctx, argparse_ns(args=["set"], shortcut=["SUPER + SHIFT + R"], exclude="laptop"))
+            with self.assertRaises(cs.SyncError) as cm:
+                cs.cmd_publish(env.ctx, argparse_ns(explicit=True, files="hypr/bindings.lua", dry_run=True))
+            self.assertIn("blocked on this device", str(cm.exception))
+
+    def test_resync_skips_whole_bindings_file_with_blocked_shortcuts(self) -> None:
+        with TempHome() as env, self._as_host("laptop"):
+            repo = make_config_repo(env.home / "cfg")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            write(env.home / ".config" / "hypr" / "bindings.lua", 'o.bind("SUPER + SHIFT + R", "Region recording", "screenrecord-region-toggle-v2")\n')
+            write(env.home / ".config" / "hypr" / "looknfeel.lua", "hl.decoration({ rounding = 12 })\n")
+            cs.cmd_targets(env.ctx, argparse_ns(args=["set"], shortcut=["SUPER + SHIFT + R"], exclude="laptop"))
+            result = cs.cmd_resync(env.ctx, argparse_ns(side="local"))
+            self.assertEqual(result["published"], ["hypr/looknfeel.lua"])
 
 
 class TargetsGuardTests(unittest.TestCase):

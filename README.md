@@ -117,6 +117,7 @@ Name each machine (Overview → Device → Edit), then open a row's **Targets** 
 - **Files** are ruled by exact repo path. **Shortcuts** are ruled per keybinding (keys are matched ignoring case and extra spaces). The **theme** is one unit: a rule on `omarchy/theme.name` covers the selected theme plus its custom overlay files.
 - A rule opts matching devices in: even machine-local files like `hypr/monitors.lua` sync there without the **Include machine-local files** toggle.
 - On blocked devices the row is invisible: it never counts as drift and cannot be applied or published even by explicit selection.
+- Blocked shortcuts also stop whole-file `bindings.lua` copies: Apply and Publish refuse rather than overwrite or share them, and Resync skips the file while cherry-picking the shortcuts that are still allowed.
 - Rule changes commit and push the marker immediately; if the push fails, the rule rides along with the next Publish.
 
 The same controls exist on the CLI: `config_sync.py targets` lists rules, `targets set <path> --only a,b --exclude c`, `targets set --shortcut "SUPER + SHIFT + R" --only desktop`, `targets clear <path>` (or `--shortcut "…"`), and `targets rename <name>` sets this device's friendly name.

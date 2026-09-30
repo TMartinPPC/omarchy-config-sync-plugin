@@ -83,7 +83,7 @@ SKIP_DIR_NAMES = {".git", "__pycache__", ".mypy_cache", ".pytest_cache", "node_m
 SKIP_FILE_NAMES = {".DS_Store"}
 SKIP_NAME_RE = re.compile(r"\.bak(\.|$)")
 PROTECTED_PLUGINS = {PLUGIN_ID}  # this plugin is excluded from sync so it does not self-report or overwrite itself
-PLUGIN_VERSION = "1.5.0"
+PLUGIN_VERSION = "1.6.0"
 
 FILE_SUMMARIES = {
     "hypr/autostart.lua": "Autostart programs",
@@ -4389,6 +4389,19 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         {"added-repo", "repo", "differs"},
         "repo_portable",
     )
+    # A whole-file bindings.lua copy bypasses per-shortcut cherry-picking, so it
+    # could silently overwrite shortcuts blocked on this device. Refuse it: the
+    # cherry-pick flow (which honors the rules) is the way to move shortcuts.
+    if blocked_keys and any(i["path"] == "hypr/bindings.lua" for i in chosen):
+        raise SyncError(
+            "Applying hypr/bindings.lua as a whole file would overwrite "
+            + str(len(blocked_keys))
+            + " shortcut"
+            + ("s" if len(blocked_keys) != 1 else "")
+            + " blocked on this device ("
+            + ", ".join(sorted(blocked_keys))
+            + "). Cherry-pick shortcuts in Review Changes instead, or remove their device rules.",
+        )
     if not chosen and not shortcut_keys:
         snap = build_snapshot(ctx, fetch=False)
         snap["applied"] = []
@@ -4613,6 +4626,19 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         {"added-local", "local", "differs"},
         "local_portable",
     )
+    # Symmetric with Apply: a whole-file bindings.lua publish would carry this
+    # device's blocked shortcut lines into the repo for every machine. Refuse
+    # it; the cherry-pick flow publishes only shortcuts whose rules allow it.
+    if blocked_keys and any(i["path"] == "hypr/bindings.lua" for i in chosen):
+        raise SyncError(
+            "Publishing hypr/bindings.lua as a whole file would share "
+            + str(len(blocked_keys))
+            + " shortcut"
+            + ("s" if len(blocked_keys) != 1 else "")
+            + " blocked on this device ("
+            + ", ".join(sorted(blocked_keys))
+            + "). Cherry-pick shortcuts in Review Changes instead, or remove their device rules.",
+        )
     if not chosen and not shortcut_keys and not list_rows:
         if getattr(args, "dry_run", False):
             snap = build_snapshot(ctx, fetch=False)
@@ -4794,6 +4820,10 @@ def cmd_resync(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     incoming = {"repo", "added-repo", "differs", "both"}
     outgoing = {"local", "added-local", "differs", "both"}
     wanted_status = incoming if side == "repo" else outgoing
+    # Blocked shortcuts never move on this device, and a whole-file bindings.lua
+    # copy would carry them — skip the file and let the cherry-pick flow handle
+    # the shortcuts whose rules allow this device.
+    blocked_keys = {s["keys"] for s in (diff.get("shortcuts") or []) if s.get("device_state") == "blocked"}
 
     files = [
         item["path"]
@@ -4802,6 +4832,7 @@ def cmd_resync(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         and item.get("status") in wanted_status
         and item.get("device_state") != "blocked"
         and (item.get("portable") or args.include_machine or item.get("device_state") == "included")
+        and not (item["path"] == "hypr/bindings.lua" and blocked_keys)
         and (item.get("repo_exists") if side == "repo" else item.get("local_exists"))
     ]
     shortcuts = [

@@ -3390,3 +3390,95 @@ class DeviceTargetSyncTests(unittest.TestCase):
             item = next(f for f in snap["diff"]["files"] if f["path"] == "terminals/kitty.conf")
             self.assertEqual(item["status"], "machine")
             self.assertEqual(snap["status"]["local_changes"], 0)
+
+
+class ThemeTargetTests(unittest.TestCase):
+    """A rule on omarchy/theme.name governs the theme as a single unit."""
+
+    def _as_host(self, name: str):
+        return patch.object(cs.socket, "gethostname", return_value=name)
+
+    def test_theme_rule_blocks_whole_theme(self) -> None:
+        with TempHome() as env, self._as_host("laptop"):
+            repo = make_config_repo(env.home / "cfg")
+            write(repo / "omarchy" / "theme.name", "tokyo-night\n")
+            write(repo / "omarchy" / "themes" / "tokyo-night" / "extra.conf", "custom = true\n")
+            git(repo, "add", "-A")
+            git(repo, "commit", "-m", "theme")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            cs.cmd_targets(env.ctx, argparse_ns(args=["set", "omarchy/theme.name"], only="desktop"))
+            snap = cs.cmd_snapshot(env.ctx, argparse_ns())
+            name_item = next(f for f in snap["diff"]["files"] if f["path"] == "omarchy/theme.name")
+            overlay = next(f for f in snap["diff"]["files"] if f["path"] == "omarchy/themes/tokyo-night/extra.conf")
+            self.assertEqual(name_item["device_state"], "blocked")
+            self.assertEqual(overlay["device_state"], "blocked")
+            self.assertIsNone(snap["diff"]["theme"])
+            dry = cs.cmd_apply(env.ctx, argparse_ns(theme=True, dry_run=True))
+            self.assertEqual(dry["applied"], [])
+
+    def test_theme_rule_allows_other_device(self) -> None:
+        with TempHome() as env, self._as_host("desktop"):
+            repo = make_config_repo(env.home / "cfg")
+            write(repo / "omarchy" / "theme.name", "tokyo-night\n")
+            git(repo, "add", "-A")
+            git(repo, "commit", "-m", "theme")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            cs.cmd_targets(env.ctx, argparse_ns(args=["set", "omarchy/theme.name"], only="desktop"))
+            snap = cs.cmd_snapshot(env.ctx, argparse_ns())
+            self.assertIsNotNone(snap["diff"]["theme"])
+            self.assertEqual(snap["diff"]["theme"]["device_state"], "included")
+            dry = cs.cmd_apply(env.ctx, argparse_ns(theme=True, dry_run=True))
+            self.assertIn("omarchy/theme.name", dry["applied"])
+
+
+class TargetsGuardTests(unittest.TestCase):
+    """targets set/clear commit in the clone: refuse a conflicted or behind base."""
+
+    def _origin_with_config(self, home: Path) -> str:
+        seed = make_config_repo(home / "seed")
+        origin = home / "origin.git"
+        subprocess.run(["git", "clone", "--bare", str(seed), str(origin)], check=True, capture_output=True, env=git_test_env())
+        return f"file://{origin}"
+
+    def _second_clone(self, origin_url: str, path: Path) -> Path:
+        subprocess.run(["git", "clone", origin_url, str(path)], check=True, capture_output=True, env=git_test_env())
+        git(path, "config", "user.name", "Test")
+        git(path, "config", "user.email", "test@example.com")
+        return path
+
+    def test_targets_set_refuses_when_clone_is_behind(self) -> None:
+        with TempHome() as env:
+            origin_url = self._origin_with_config(env.home)
+            cs.cmd_connect(env.ctx, argparse_ns(args=[origin_url]))
+            side = self._second_clone(origin_url, env.home / "side")
+            # Another machine pushed a rule; this clone has not pulled it yet.
+            write(side / cs.MARKER_NAME, json.dumps({"format": "omarchy-config", "sync_targets": {"hypr/input.lua": {"only": ["x"]}}}) + "\n")
+            commit_all(side, "rule from the other machine")
+            git(side, "push", "-u", "origin", "main")
+            # An uncommitted local marker edit blocks the automatic merge, the
+            # same way it blocks Publish — git refuses to merge a dirty tree.
+            write(env.ctx.default_clone / cs.MARKER_NAME, json.dumps({"format": "omarchy-config", "sync_targets": {}}) + "\n")
+            with self.assertRaises(cs.SyncError) as cm:
+                cs.cmd_targets(env.ctx, argparse_ns(args=["set", "hypr/monitors.lua"], only="desktop"))
+            self.assertIn("behind", str(cm.exception))
+
+    def test_targets_set_refuses_when_clone_has_conflicts(self) -> None:
+        with TempHome() as env:
+            origin_url = self._origin_with_config(env.home)
+            cs.cmd_connect(env.ctx, argparse_ns(args=[origin_url]))
+            cs.cmd_targets(env.ctx, argparse_ns(args=["set", "hypr/monitors.lua"], only="desktop"))
+            side = self._second_clone(origin_url, env.home / "side")
+            write(side / cs.MARKER_NAME, json.dumps({"format": "omarchy-config", "sync_targets": {"hypr/monitors.lua": {"only": ["htpc"]}}}) + "\n")
+            commit_all(side, "conflicting rule from the other machine")
+            git(side, "push", "-u", "origin", "main")
+            # Diverge the managed clone on the same marker region, then merge.
+            clone = env.ctx.default_clone
+            write(clone / cs.MARKER_NAME, json.dumps({"format": "omarchy-config", "sync_targets": {"hypr/monitors.lua": {"only": ["other"]}}}) + "\n")
+            commit_all(clone, "conflicting local rule")
+            git(clone, "fetch", "origin")
+            git(clone, "merge", "--no-edit", "origin/main", check=False)
+            status = git(clone, "status", "--porcelain").stdout
+            self.assertIn("UU", status)
+            with self.assertRaises(cs.SyncError) as cm:
+                cs.cmd_targets(env.ctx, argparse_ns(args=["set", "hypr/monitors.lua"], only="desktop"))
+            self.assertIn("conflicts", str(cm.exception))

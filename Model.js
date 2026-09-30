@@ -275,6 +275,9 @@ function appendThemes(out, list, hiddenMap) {
     var id = t.id || "selected"
     if (isItemHidden("t", id, hiddenMap, t)) continue
     out.push(reviewItem("t", id, t.display || t.slug, t.semantic_summary || t.slug, t.status, "Theme", t.status === "both", 0, false, t.changes || []))
+    var row = out[out.length - 1]
+    row.targets = t.targets || null
+    row.deviceState = String(t.device_state || "default")
   }
 }
 

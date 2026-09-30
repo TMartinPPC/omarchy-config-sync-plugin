@@ -83,7 +83,7 @@ SKIP_DIR_NAMES = {".git", "__pycache__", ".mypy_cache", ".pytest_cache", "node_m
 SKIP_FILE_NAMES = {".DS_Store"}
 SKIP_NAME_RE = re.compile(r"\.bak(\.|$)")
 PROTECTED_PLUGINS = {PLUGIN_ID}  # this plugin is excluded from sync so it does not self-report or overwrite itself
-PLUGIN_VERSION = "1.4.1"
+PLUGIN_VERSION = "1.5.0"
 
 FILE_SUMMARIES = {
     "hypr/autostart.lua": "Autostart programs",
@@ -1977,13 +1977,16 @@ def collect_inventory(ctx: Context, repo: Path) -> list[dict[str, Any]]:
             return
         local_regular = local.is_file() and not local.is_symlink() and not os.path.islink(local)
         repo_regular = repo_file.is_file() and not repo_file.is_symlink() and not os.path.islink(repo_file)
+        # Theme files share one rule: a target on omarchy/theme.name governs
+        # the selected theme and its custom overlay files as a single unit.
+        rule_rel = THEME_REL if group == "theme" else rel
         items[rel] = {
             "path": rel,
             "group": group,
             "summary": summary_for(rel),
             "portable": not is_machine_local(rel, local_paths),
-            "device_state": device_target_state(rel, targets, names),
-            "targets": targets.get(rel),
+            "device_state": device_target_state(rule_rel, targets, names),
+            "targets": targets.get(rule_rel),
             "local_path": str(local),
             "repo_path": str(repo_file),
             "local_exists": local_regular,
@@ -3634,6 +3637,8 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
             "changes": (name_item or {}).get("changes", []),
             "files": [f["path"] for f in theme_files],
             "custom": any(f["path"].startswith("omarchy/themes/") for f in theme_files),
+            "targets": (name_item or {}).get("targets"),
+            "device_state": (name_item or {}).get("device_state") or "default",
             "default_apply": (status in {"repo", "added-repo", "differs"} or (name_item or {}).get("default_apply")) and not is_hidden_item("t", "selected", hidden_keys),
             "default_publish": (status in {"local", "added-local", "differs"} or (name_item or {}).get("default_publish")) and not is_hidden_item("t", "selected", hidden_keys),
             "hidden": is_hidden_item("t", "selected", hidden_keys),
@@ -5141,6 +5146,24 @@ def cmd_targets(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
 
     if sub not in {"set", "clear"}:
         raise SyncError("Unknown targets action. Use list, set, clear, or rename.")
+
+    # A rule change is a commit in the clone. Never build on a conflicted or
+    # outdated base — the same conditions Publish refuses under — so the
+    # marker can never be committed with conflict markers in it.
+    fetch_error = fetch_repo(repo)
+    git_fields = git_status_fields(repo, fetch_error)
+    git_fields = integrate_remote(repo, git_fields)
+    if git_fields["conflicts"]:
+        raise SyncError(
+            "The git clone has merge conflicts. Resolve them before changing sync targets.",
+            extra={"conflicts": git_fields["conflicts"]},
+        )
+    if git_fields["behind"]:
+        raise SyncError(
+            git_fields.get("merge_error")
+            or "The clone is behind origin. Pull first, then change sync targets.",
+            extra={"ahead": git_fields["ahead"], "behind": git_fields["behind"]},
+        )
 
     rel = str(rest[0] if rest else getattr(args, "files", "") or "").strip()
     if not validate_safe_rel_path(rel):

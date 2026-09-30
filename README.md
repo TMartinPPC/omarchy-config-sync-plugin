@@ -28,7 +28,7 @@ When there is drift, **Review Changes** opens a checklist: incoming vs local **s
 - **Publish** copies this machine → repo, commits, and pushes so the next machine can Apply.
 - **Drift detection** on open (and every 10 minutes): local-only edits, incoming remote files, both-changed files, and git merge conflicts.
 - **Conflict handling**: per-file Keep local / Take repo for overlapping edits; Keep local / Take incoming for git merge conflicts. Display layout (`hypr/monitors.lua`) stays on this machine unless you opt in.
-- **Per-device targets**: name each device, then limit any file to chosen devices ("only sync monitors.lua to desktop") or block it on some ("never sync shell.toml to work-laptop").
+- **Per-device targets**: name each device, then limit any file — or the theme as a whole — to chosen devices ("only sync monitors.lua to desktop") or block it on some ("never sync shell.toml to work-laptop").
 
 ## Install
 
@@ -98,22 +98,23 @@ Per-machine Hyprland overlays (`*.local.lua`, `local.conf`, `input.local.lua`, �
 
 ### Per-device sync targets
 
-Name each machine (Overview → Device → Edit), then open a file row's **Targets** button in the Changes list to limit where that file syncs. Rules live in `.omarchy-config.json` in the repo, so a rule set once applies on every machine:
+Name each machine (Overview → Device → Edit), then open a row's **Targets** button in the Changes list to limit where it syncs. Rules live in `.omarchy-config.json` in the repo, so a rule set once applies on every machine:
 
 ```json
 {
   "sync_targets": {
     "hypr/monitors.lua": { "only": ["desktop", "htpc"] },
-    "omarchy/shell.toml": { "exclude": ["work-laptop"] }
+    "omarchy/shell.toml": { "exclude": ["work-laptop"] },
+    "omarchy/theme.name": { "only": ["desktop", "laptop"] }
   }
 }
 ```
 
-- `only` — the file syncs only to the listed devices.
-- `exclude` — the file never syncs on the listed devices.
+- `only` — syncs only to the listed devices; `exclude` — never syncs on the listed devices.
 - A device matches its friendly name or its hostname, case-insensitive.
+- **Files** are ruled by exact repo path. The **theme** is one unit: a rule on `omarchy/theme.name` covers the selected theme plus its custom overlay files.
 - A rule opts matching devices in: even machine-local files like `hypr/monitors.lua` sync there without the **Include machine-local files** toggle.
-- On blocked devices the file looks machine-local: it is invisible in Changes, never counts as drift, and cannot be applied even by explicit selection.
+- On blocked devices the row is invisible: it never counts as drift and cannot be applied or published even by explicit selection.
 - Rule changes commit and push the marker immediately; if the push fails, the rule rides along with the next Publish.
 
 The same controls exist on the CLI: `config_sync.py targets` lists rules, `targets set <path> --only a,b --exclude c`, `targets clear <path>`, and `targets rename <name>` sets this device's friendly name.

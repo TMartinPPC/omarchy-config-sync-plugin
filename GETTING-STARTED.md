@@ -112,7 +112,7 @@ Open **Review list** (or the Changes tab) and expand **Outgoing**. It holds:
 
 **Machine-local files** stay on this machine: display layout (`hypr/monitors.lua`) and anything you list as `machine_local` in `.omarchy-config.json`. Overlay files named `*.local.lua` / `local.conf` under `hypr/` are not synced at all. Turn on **Include machine-local files** on the Changes tab only if you mean it.
 
-**Syncing a file to only some devices**: name this machine on the Overview tab (Device → Edit), then press **Targets** on a file row in the Changes list and list the devices it should reach — for example keep `hypr/monitors.lua` on `desktop` only, or block a terminal config on your work laptop. Rules are saved into `.omarchy-config.json` in the repo, so once pushed every machine follows them.
+**Syncing something to only some devices**: name this machine on the Overview tab (Device → Edit), then press **Targets** on a row in the Changes list — a config file or the theme — and list the devices it should reach. For example keep `hypr/monitors.lua` on `desktop` only, or keep your work laptop on its own theme. Rules are saved into `.omarchy-config.json` in the repo, so once pushed every machine follows them.
 
 When it looks right, click **Seed repo (N items)** on the Overview card. Confirm with **Seed & push**. The plugin copies those files into the private repo, commits, and pushes.
 

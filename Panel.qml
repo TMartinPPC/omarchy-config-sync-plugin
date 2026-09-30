@@ -225,6 +225,25 @@ Panel {
     run(["targets", "clear", String(path)])
   }
 
+  function saveTargets(ruleKind, key, only, exclude) {
+    if (String(ruleKind) === "s") {
+      var args = ["targets", "set", "--shortcut", String(key)]
+      if (String(only || "").trim()) args.push("--only", String(only).trim())
+      if (String(exclude || "").trim()) args.push("--exclude", String(exclude).trim())
+      run(args)
+      return
+    }
+    runTargetsSet(key, only, exclude)
+  }
+
+  function clearTargets(ruleKind, key) {
+    if (String(ruleKind) === "s") {
+      run(["targets", "clear", "--shortcut", String(key)])
+      return
+    }
+    runTargetsClear(key)
+  }
+
   function startEditDevice() {
     deviceNameInput = String((status && (status.device_name || status.hostname)) || "")
     editingDevice = true
@@ -3141,8 +3160,9 @@ Panel {
           readonly property string bothKey: rowKind === "f" ? rowId : (rowKind + ":" + rowId)
           readonly property string typeLabel: sectionRoot.mixed ? String(modelData.typeLabel || "") : ""
           readonly property bool pickable: modelData.pickable !== false
-          readonly property string rowAction: String(modelData.action || "")
-          readonly property string targetHint: rowKind === "f" ? Model.targetHint(modelData.targets, modelData.deviceState) : ""
+        readonly property string rowAction: String(modelData.action || "")
+        readonly property bool hasTargetsEditor: rowKind === "f" || rowKind === "s" || rowKind === "t"
+        readonly property string targetHint: hasTargetsEditor ? Model.targetHint(modelData.targets, modelData.deviceState) : ""
 
           width: parent.width
           implicitHeight: rowInner.implicitHeight + Style.space(16)
@@ -3301,21 +3321,21 @@ Panel {
               onClicked: root.togglePick(rowBox.rowKind, rowBox.rowId)
             }
 
-            Button {
-              id: targetsBtn
-              visible: rowBox.rowKind === "f"
-              text: rowBox.targetHint ? "Targets ●" : "Targets"
-              iconText: "󰓅"
-              tooltipText: "Choose which devices this file syncs to"
-              bordered: true
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              fontSize: Style.font.caption
-              selected: root.targetsPath === rowBox.rowId
-              anchors.verticalCenter: parent.verticalCenter
-              enabled: !root.busy
-              onClicked: root.toggleTargetsEditor(rowBox.rowId)
-            }
+          Button {
+            id: targetsBtn
+            visible: rowBox.hasTargetsEditor
+            text: rowBox.targetHint ? "Targets ●" : "Targets"
+            iconText: "󰓅"
+            tooltipText: rowBox.rowKind === "s" ? "Choose which devices this shortcut syncs to" : (rowBox.rowKind === "t" ? "Choose which devices the theme syncs to" : "Choose which devices this file syncs to")
+            bordered: true
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            fontSize: Style.font.caption
+            selected: root.targetsPath === rowBox.rowId
+            anchors.verticalCenter: parent.verticalCenter
+            enabled: !root.busy
+            onClicked: root.toggleTargetsEditor(rowBox.rowId)
+          }
 
             Button {
               id: hideBtn
@@ -3343,7 +3363,8 @@ Panel {
 
         TargetsEditor {
           width: parent.width
-          visible: rowBox.rowKind === "f" && root.targetsPath === rowBox.rowId
+          visible: rowBox.hasTargetsEditor && root.targetsPath === rowBox.rowId
+          ruleKind: rowBox.rowKind
           path: rowBox.rowId
           rule: rowBox.modelData.targets
         }
@@ -3624,10 +3645,12 @@ Panel {
 
   component TargetsEditor: Rectangle {
     id: targetsRoot
+    property string ruleKind: "f"
     property string path: ""
     property var rule: null
     readonly property string ruleOnly: rule && rule.only ? rule.only.join(", ") : ""
     readonly property string ruleExclude: rule && rule.exclude ? rule.exclude.join(", ") : ""
+    readonly property string subjectLabel: ruleKind === "s" ? "this shortcut" : (ruleKind === "t" ? "the selected theme (and its custom files)" : "this file")
     readonly property string deviceLabel: {
       var name = String((root.status && root.status.device_name) || "")
       if (!name) name = String((root.status && root.status.hostname) || "this device")
@@ -3669,7 +3692,7 @@ Panel {
       Text {
         width: parent.width
         textFormat: Text.PlainText
-        text: "Limit which devices this file syncs to. This device is '" + targetsRoot.deviceLabel + "' (rename it on the Overview tab). Leave both fields empty to sync everywhere."
+        text: "Limit which devices " + targetsRoot.subjectLabel + " syncs to. This device is '" + targetsRoot.deviceLabel + "' (rename it on the Overview tab). Leave both fields empty to sync everywhere."
         color: root.dim
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
@@ -3682,7 +3705,7 @@ Panel {
         foreground: root.foreground
         font.family: root.fontFamily
         enabled: !root.busy
-        onAccepted: root.runTargetsSet(targetsRoot.path, targetsOnlyField.text, targetsExcludeField.text)
+        onAccepted: root.saveTargets(targetsRoot.ruleKind, targetsRoot.path, targetsOnlyField.text, targetsExcludeField.text)
       }
       TextField {
         id: targetsExcludeField
@@ -3691,7 +3714,7 @@ Panel {
         foreground: root.foreground
         font.family: root.fontFamily
         enabled: !root.busy
-        onAccepted: root.runTargetsSet(targetsRoot.path, targetsOnlyField.text, targetsExcludeField.text)
+        onAccepted: root.saveTargets(targetsRoot.ruleKind, targetsRoot.path, targetsOnlyField.text, targetsExcludeField.text)
       }
       Row {
         spacing: Style.space(6)
@@ -3703,7 +3726,7 @@ Panel {
           fontFamily: root.fontFamily
           fontSize: Style.font.caption
           enabled: !root.busy
-          onClicked: root.runTargetsSet(targetsRoot.path, targetsOnlyField.text, targetsExcludeField.text)
+          onClicked: root.saveTargets(targetsRoot.ruleKind, targetsRoot.path, targetsOnlyField.text, targetsExcludeField.text)
         }
         Button {
           visible: targetsRoot.rule !== null
@@ -3714,7 +3737,7 @@ Panel {
           fontFamily: root.fontFamily
           fontSize: Style.font.caption
           enabled: !root.busy
-          onClicked: root.runTargetsClear(targetsRoot.path)
+          onClicked: root.clearTargets(targetsRoot.ruleKind, targetsRoot.path)
         }
         Button {
           text: "Cancel"

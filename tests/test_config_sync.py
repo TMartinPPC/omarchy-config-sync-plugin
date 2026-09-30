@@ -3390,3 +3390,128 @@ class DeviceTargetSyncTests(unittest.TestCase):
             item = next(f for f in snap["diff"]["files"] if f["path"] == "terminals/kitty.conf")
             self.assertEqual(item["status"], "machine")
             self.assertEqual(snap["status"]["local_changes"], 0)
+
+
+class ShortcutThemeTargetTests(unittest.TestCase):
+    """Per-shortcut and whole-theme sync target rules."""
+
+    def _as_host(self, name: str):
+        return patch.object(cs.socket, "gethostname", return_value=name)
+
+    def test_normalize_keys(self) -> None:
+        self.assertEqual(cs.normalize_keys("SUPER  +   SHIFT + R"), "super + shift + r")
+        self.assertEqual(cs.normalize_keys(" super+r "), "super+r")
+        self.assertIsNone(cs.normalize_keys("   "))
+        self.assertIsNone(cs.normalize_keys(None))
+
+    def test_shortcut_targets_parse_and_normalize(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            write(
+                repo / cs.MARKER_NAME,
+                json.dumps(
+                    {
+                        "format": "omarchy-config",
+                        "sync_shortcuts": {
+                            "SUPER + SHIFT + R": {"only": ["Desktop"]},
+                            "  ctrl + 9  ": {"exclude": ["laptop", "laptop"]},
+                            "../evil": {"only": ["x"]},
+                            "": {"only": ["x"]},
+                            "broken": "nope",
+                        },
+                    }
+                )
+                + "\n",
+            )
+            targets = cs.shortcut_targets(repo)
+            self.assertEqual(targets["super + shift + r"], {"only": ["desktop"]})
+            self.assertEqual(targets["ctrl + 9"], {"exclude": ["laptop"]})
+            # Keys are not paths: junk entries are harmless (they can never
+            # match a real bind) and survive, while empty/broken ones drop.
+            self.assertEqual(len(targets), 3)
+
+    def test_shortcut_rule_blocks_apply_on_this_device(self) -> None:
+        with TempHome() as env, self._as_host("laptop"):
+            repo = make_config_repo(env.home / "cfg")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            cs.cmd_targets(env.ctx, argparse_ns(args=["set"], shortcut=["SUPER + SHIFT + R"], only="desktop"))
+            snap = cs.cmd_snapshot(env.ctx, argparse_ns())
+            row = next(s for s in snap["diff"]["shortcuts"] if s["keys"] == "SUPER + SHIFT + R")
+            self.assertEqual(row["device_state"], "blocked")
+            self.assertEqual(row["status"], "machine")
+            self.assertFalse(row["default_apply"])
+            # Other shortcuts on the same file are untouched; the file row stays
+            # because those still cherry-pick on this device.
+            other = next(s for s in snap["diff"]["shortcuts"] if s["keys"] == "CTRL + 9")
+            self.assertEqual(other["device_state"], "default")
+            self.assertNotEqual(other["status"], "machine")
+            # Explicitly requesting the blocked shortcut applies nothing.
+            dry = cs.cmd_apply(env.ctx, argparse_ns(explicit=True, shortcut=["SUPER + SHIFT + R"], dry_run=True))
+            self.assertEqual(dry["applied"], [])
+
+    def test_shortcut_rule_allows_other_device(self) -> None:
+        with TempHome() as env, self._as_host("desktop"):
+            repo = make_config_repo(env.home / "cfg")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            cs.cmd_targets(env.ctx, argparse_ns(args=["set"], shortcut=["SUPER  + shift + R"], only="desktop"))
+            snap = cs.cmd_snapshot(env.ctx, argparse_ns())
+            row = next(s for s in snap["diff"]["shortcuts"] if s["keys"] == "SUPER + SHIFT + R")
+            self.assertEqual(row["device_state"], "included")
+            self.assertNotEqual(row["status"], "machine")
+            # Rule keys match case/whitespace-insensitively; the bind applies.
+            dry = cs.cmd_apply(env.ctx, argparse_ns(explicit=True, shortcut=["SUPER + SHIFT + R"], dry_run=True))
+            self.assertEqual(dry["applied"], ["hypr/bindings.lua"])
+
+    def test_shortcut_rule_blocks_publish(self) -> None:
+        with TempHome() as env, self._as_host("laptop"):
+            repo = make_config_repo(env.home / "cfg")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            cs.cmd_targets(env.ctx, argparse_ns(args=["set"], shortcut=["CTRL + 9"], exclude="laptop"))
+            dry = cs.cmd_publish(env.ctx, argparse_ns(explicit=True, shortcut=["CTRL + 9"], dry_run=True))
+            self.assertEqual(dry["published"], [])
+
+    def test_theme_rule_blocks_whole_theme(self) -> None:
+        with TempHome() as env, self._as_host("laptop"):
+            repo = make_config_repo(env.home / "cfg")
+            write(repo / "omarchy" / "theme.name", "tokyo-night\n")
+            write(repo / "omarchy" / "themes" / "tokyo-night" / "extra.conf", "custom = true\n")
+            git(repo, "add", "-A")
+            git(repo, "commit", "-m", "theme")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            cs.cmd_targets(env.ctx, argparse_ns(args=["set", "omarchy/theme.name"], only="desktop"))
+            snap = cs.cmd_snapshot(env.ctx, argparse_ns())
+            # One rule on omarchy/theme.name governs the theme name and overlay files.
+            name_item = next(f for f in snap["diff"]["files"] if f["path"] == "omarchy/theme.name")
+            overlay = next(f for f in snap["diff"]["files"] if f["path"] == "omarchy/themes/tokyo-night/extra.conf")
+            self.assertEqual(name_item["device_state"], "blocked")
+            self.assertEqual(overlay["device_state"], "blocked")
+            self.assertIsNone(snap["diff"]["theme"])
+            dry = cs.cmd_apply(env.ctx, argparse_ns(theme=True, dry_run=True))
+            self.assertEqual(dry["applied"], [])
+
+    def test_theme_rule_allows_other_device(self) -> None:
+        with TempHome() as env, self._as_host("desktop"):
+            repo = make_config_repo(env.home / "cfg")
+            write(repo / "omarchy" / "theme.name", "tokyo-night\n")
+            git(repo, "add", "-A")
+            git(repo, "commit", "-m", "theme")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            cs.cmd_targets(env.ctx, argparse_ns(args=["set", "omarchy/theme.name"], only="desktop"))
+            snap = cs.cmd_snapshot(env.ctx, argparse_ns())
+            self.assertIsNotNone(snap["diff"]["theme"])
+            self.assertEqual(snap["diff"]["theme"]["device_state"], "included")
+            dry = cs.cmd_apply(env.ctx, argparse_ns(theme=True, dry_run=True))
+            self.assertIn("omarchy/theme.name", dry["applied"])
+
+    def test_targets_list_and_clear_shortcut_rules(self) -> None:
+        with TempHome() as env, self._as_host("laptop"):
+            repo = make_config_repo(env.home / "cfg")
+            cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+            cs.cmd_targets(env.ctx, argparse_ns(args=["set"], shortcut=["SUPER + SHIFT + R"], only="desktop"))
+            out = cs.cmd_targets(env.ctx, argparse_ns(args=[]))
+            self.assertEqual(out["shortcuts"], {"super + shift + r": {"only": ["desktop"]}})
+            marker = json.loads((repo / cs.MARKER_NAME).read_text(encoding="utf-8"))
+            self.assertEqual(marker["sync_shortcuts"]["super + shift + r"], {"only": ["desktop"]})
+            cs.cmd_targets(env.ctx, argparse_ns(args=["clear"], shortcut=["super + SHIFT + R"]))
+            out = cs.cmd_targets(env.ctx, argparse_ns(args=[]))
+            self.assertEqual(out["shortcuts"], {})
